@@ -1,13 +1,11 @@
 /*
  * screenshot_config.h — the settings GnuChanScreenShoot is built from.
  *
- * GnuChanScreenShoot is configured by a script, not by a file of key = value
- * pairs, the same way GnuChanWM, GnuChanTerm and GnuChanSS are: the same file
- * a person would write to pick the save directory, the format, and the hotkeys.
- * That script is Python, and this header is the shape of what running it
- * produces — the small, fixed set of things a screenshot tool can be asked for.
+ * GnuChanScreenShoot reads a plain Key = value config. This header is the
+ * shape of the settings it understands — the small, fixed set of things the
+ * screenshot tool can be asked for.
  *
- * Everything here is plain data. The script is read by a parser, walked by
+ * Everything here is plain data. The config is read by a parser, walked by
  * screenshot_config.c, and drawn by GnuChanScreenShoot.c. Nothing in this
  * header knows about X.
  */
@@ -27,9 +25,8 @@
    unless the settings window changes it. */
 #define SS_SAVE_DIR_DEFAULT "~/Pictures"
 
-/* The hotkeys: Alt+P grabs the focused window and saves it. Print/SysRq opens
-   the settings window. Both are read from the script so a person can rebind
-   them if they want. */
+/* The default shortcuts: Alt+P opens the detailed capture window and
+   Print/SysRq opens settings. */
 #define SS_HOTKEY_CAPTURE "Alt+P"
 #define SS_HOTKEY_SETTINGS "Print"
 
@@ -66,7 +63,7 @@ struct SsStatement {
     int arg_count;
 };
 
-/* The settings a script may name. Adding a setting is adding one field here,
+/* The settings a config may name. Adding a setting is adding one field here,
    one branch in the config walker, and one row in the settings window. */
 typedef struct SsConfig {
     /* Where screenshots land. $HOME/Pictures by default; ~ is expanded. */
@@ -93,7 +90,7 @@ typedef struct SsConfig {
    ~/Pictures, settings window on. */
 void ss_config_defaults(SsConfig *config);
 
-/* Read the script at path into config. Returns 0 when the file was read and
+/* Read the config at path into config. Returns 0 when the file was read and
    walked, -1 when it could not be opened or could not be parsed — in which
    case config is left at its defaults and `error` says why. */
 int ss_config_load(SsConfig *config, const char *path);
@@ -102,12 +99,12 @@ int ss_config_load(SsConfig *config, const char *path);
    file. Always leaves a usable config. Returns 0 when a file was read. */
 int ss_config_load_default(SsConfig *config);
 
-/* Where the script is looked for: $XDG_CONFIG_HOME/GnuChanScreenShoot/
-   GnuChanScreenShoot.py, or ~/.config/GnuChanScreenShoot/GnuChanScreenShoot.py.
-   Written into buffer, which is returned. */
+/* Where settings are looked for: $XDG_CONFIG_HOME/GnuChanScreenShoot/
+   GnuChanScreenShoot.conf, or
+   ~/.config/GnuChanScreenShoot/GnuChanScreenShoot.conf. */
 char *ss_config_path(char *buffer, unsigned int size);
 
-/* Parse one script file into a statement list. Reused by the settings window
+/* Parse one config file into a statement list. Reused by the settings window
    when it wants to show what the file says. */
 int ss_parse_file(const char *path, struct SsStatement **out, int *out_count);
 void ss_parse_free(struct SsStatement *statements, int count);

@@ -1,5 +1,5 @@
 /*
- * ss_parser.h — declarations for the settings script parser.
+ * ss_parser.h — declarations for the settings config parser.
  */
 #ifndef SS_PARSER_H
 #define SS_PARSER_H

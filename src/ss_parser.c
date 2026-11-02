@@ -1,10 +1,11 @@
 /*
- * ss_parser.c — the settings script parser for GnuChanScreenShoot.
+ * ss_parser.c — the settings config parser for GnuChanScreenShoot.
  *
- * Reads the Python-style settings script and walks it into statement trees.
+ * Reads Key = value config lines into statement trees. It also retains the
+ * old data-only call syntax for existing .py-named settings files.
  * This is the same parser family as GnuChanWM's wm_config_parser.c and
  * GnuChanSS's ss_parser.c: a tiny hand-written recursive descent parser for
- * the call/assign syntax the settings scripts use.
+ * the call/assign syntax used by the legacy format.
  */
 #include <ctype.h>
 #include <stdio.h>
@@ -205,23 +206,28 @@ int ss_parse_file(const char *path, struct SsStatement **out,
                 return -1;
             }
             stmt.value = value;
-        } else if (peek() == '.') {
-            s_cursor++; /* '.' */
-            char method[SS_TEXT_LENGTH];
-            if (!read_name(method, sizeof(method))) {
-                set_error("expected a method name");
-                free(text);
-                return -1;
+        } else if (peek() == '.' || peek() == '(') {
+            /* read_name() keeps dots so dotted Key names work in .conf files;
+               legacy calls therefore arrive with their complete dotted name
+               already in target and the cursor directly at '('. */
+            if (peek() == '.') {
+                s_cursor++; /* '.' */
+                char method[SS_TEXT_LENGTH];
+                if (!read_name(method, sizeof(method))) {
+                    set_error("expected a method name");
+                    free(text);
+                    return -1;
+                }
+                char target[sizeof(stmt.target)];
+                int written = snprintf(target, sizeof(target), "%s.%s",
+                                       stmt.target, method);
+                if (written < 0 || (size_t)written >= sizeof(target)) {
+                    set_error("setting name is too long");
+                    free(text);
+                    return -1;
+                }
+                memcpy(stmt.target, target, (size_t)written + 1);
             }
-            char target[sizeof(stmt.target)];
-            int written = snprintf(target, sizeof(target), "%s.%s",
-                                   stmt.target, method);
-            if (written < 0 || (size_t)written >= sizeof(target)) {
-                set_error("setting name is too long");
-                free(text);
-                return -1;
-            }
-            memcpy(stmt.target, target, (size_t)written + 1);
             skip_ws();
             if (peek() != '(') {
                 set_error("expected '(' after method name");

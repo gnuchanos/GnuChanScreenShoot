@@ -8,16 +8,16 @@
  *
  * Two hotkeys, one job:
  *
- *   Alt+P        capture the focused window (or the whole screen) and write
- *                it to SaveDir, as named in the settings script.
+ *   Alt+P        open the detailed capture window, choose a target and save
+ *                the image to SaveDir.
  *   Print/SysRq  open an X11 window with the detailed settings: where
  *                screenshots go, which format, JPEG quality, whether Alt+P
  *                grabs the focused window or the whole screen.
  *
- * The settings live in a script at
- *   ~/.config/GnuChanScreenShoot/GnuChanScreenShoot.py
- * the same way every other GnuChan program keeps its settings, and
- * GnuChanSettings edits that same file.
+ * The settings live in
+ *   ~/.config/GnuChanScreenShoot/GnuChanScreenShoot.conf
+ * as plain Key = value data. Older .py-named config files are parsed as data
+ * for migration; they are never executed.
  *
  * A screenshot is written as a PNG or JPEG with a timestamp in the name so
  * nothing is ever overwritten.
@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -85,7 +87,10 @@ static void expand_tilde(char *out, unsigned int size, const char *in) {
 /* Make every directory along a path that does not exist yet. */
 static int ensure_directory(const char *path) {
     char tmp[SS_TEXT_LENGTH];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    int written = snprintf(tmp, sizeof(tmp), "%s", path ? path : "");
+    if (written <= 0 || (size_t)written >= sizeof(tmp)) {
+        return -1;
+    }
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
@@ -101,15 +106,36 @@ static int ensure_directory(const char *path) {
     return 0;
 }
 
-/* Build a timestamped filename with the selected format's extension. */
-static void screenshot_filename(char *out, unsigned int size,
+/* Create a unique timestamped file without ever truncating an earlier capture. */
+static int open_screenshot_file(char *out, unsigned int size,
                                 const char *save_dir, SsFormat format) {
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
+    if (!tm) {
+        return -1;
+    }
     char stamp[32];
-    strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm);
-    snprintf(out, size, "%s/screenshot-%s.%s", save_dir, stamp,
-             format == SS_FORMAT_JPEG ? "jpg" : "png");
+    if (strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm) == 0) {
+        return -1;
+    }
+    const char *extension = format == SS_FORMAT_JPEG ? "jpg" : "png";
+    for (unsigned int suffix = 0;; suffix++) {
+        int written = suffix == 0
+                          ? snprintf(out, size, "%s/screenshot-%s.%s",
+                                     save_dir, stamp, extension)
+                          : snprintf(out, size, "%s/screenshot-%s-%u.%s",
+                                     save_dir, stamp, suffix, extension);
+        if (written < 0 || (unsigned int)written >= size) {
+            return -1;
+        }
+        int fd = open(out, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd >= 0 || errno != EEXIST) {
+            return fd;
+        }
+        if (suffix == UINT_MAX) {
+            return -1;
+        }
+    }
 }
 
 static unsigned char component(unsigned long pixel, unsigned long mask) {
@@ -147,12 +173,7 @@ static unsigned char *image_rgb(XImage *image) {
     return pixels;
 }
 
-static int write_png(const char *path, XImage *image) {
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        return -1;
-    }
-
+static int write_png(FILE *f, XImage *image) {
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING,
                                                NULL, NULL, NULL);
     png_infop info = png ? png_create_info_struct(png) : NULL;
@@ -177,9 +198,6 @@ static int write_png(const char *path, XImage *image) {
     if (png) {
         png_destroy_write_struct(&png, info ? &info : NULL);
     }
-    if (fclose(f) != 0) {
-        ok = 0;
-    }
     return ok ? 0 : -1;
 }
 
@@ -193,14 +211,9 @@ static void jpeg_failure(j_common_ptr common) {
     longjmp(error->jump, 1);
 }
 
-static int write_jpeg(const char *path, XImage *image, int quality) {
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        return -1;
-    }
+static int write_jpeg(FILE *f, XImage *image, int quality) {
     unsigned char *pixels = image_rgb(image);
     if (!pixels) {
-        fclose(f);
         return -1;
     }
 
@@ -211,7 +224,6 @@ static int write_jpeg(const char *path, XImage *image, int quality) {
     if (setjmp(error.jump)) {
         jpeg_destroy_compress(&jpeg);
         free(pixels);
-        fclose(f);
         return -1;
     }
     jpeg_create_compress(&jpeg);
@@ -231,41 +243,70 @@ static int write_jpeg(const char *path, XImage *image, int quality) {
     jpeg_finish_compress(&jpeg);
     jpeg_destroy_compress(&jpeg);
     free(pixels);
-    int ok = fclose(f) == 0;
-    return ok ? 0 : -1;
+    return 0;
 }
 
 /* --- capture -------------------------------------------------------------- */
 
 /* Grab the focused window, or fall back to the root window. Returns the
    window and its geometry relative to the root. */
+static Window root_child(Display *display, Window candidate) {
+    Window root = DefaultRootWindow(display);
+    if (candidate == None || candidate == PointerRoot || candidate == root) {
+        return root;
+    }
+
+    Window parent = None;
+    Window *children = NULL;
+    unsigned int nchildren = 0;
+    while (XQueryTree(display, candidate, &root, &parent, &children,
+                      &nchildren)) {
+        if (children) {
+            XFree(children);
+            children = NULL;
+        }
+        if (parent == None || parent == root || parent == candidate) {
+            return parent == root ? candidate : root;
+        }
+        candidate = parent;
+    }
+    return root;
+}
+
+static Window current_focus(Display *display) {
+    Window root = DefaultRootWindow(display);
+    Window focus = None;
+    int revert = 0;
+    XGetInputFocus(display, &focus, &revert);
+    if (focus == None || focus == PointerRoot || focus == root) {
+        Atom active_atom = XInternAtom(display, "_NET_ACTIVE_WINDOW", True);
+        if (active_atom != None) {
+            Atom actual_type = None;
+            int actual_format = 0;
+            unsigned long count = 0, remaining = 0;
+            unsigned char *data = NULL;
+            if (XGetWindowProperty(display, root, active_atom, 0, 1, False,
+                                   XA_WINDOW, &actual_type, &actual_format,
+                                   &count, &remaining, &data) == Success &&
+                data && actual_type == XA_WINDOW && actual_format == 32 &&
+                count == 1) {
+                focus = *(Window *)data;
+            }
+            if (data) {
+                XFree(data);
+            }
+        }
+    }
+    return root_child(display, focus);
+}
+
 static Window focused_window(Display *display, int *x, int *y,
                              unsigned int *w, unsigned int *h,
                              unsigned int *border, unsigned int *depth) {
     Window root = DefaultRootWindow(display);
-    Window focus = None;
-    int revert = 0;
-    Atom active_atom = XInternAtom(display, "_NET_ACTIVE_WINDOW", True);
-    if (active_atom != None) {
-        Atom actual_type = None;
-        int actual_format = 0;
-        unsigned long count = 0, remaining = 0;
-        unsigned char *data = NULL;
-        if (XGetWindowProperty(display, root, active_atom, 0, 1, False,
-                               XA_WINDOW, &actual_type, &actual_format,
-                               &count, &remaining, &data) == Success &&
-            data && actual_type == XA_WINDOW && actual_format == 32 &&
-            count == 1) {
-            focus = *(Window *)data;
-        }
-        if (data) {
-            XFree(data);
-        }
-    }
-    if (focus == None) {
-        XGetInputFocus(display, &focus, &revert);
-    }
-    if (focus == None || focus == PointerRoot || focus == root) {
+    XSync(display, False);
+    Window focus = current_focus(display);
+    if (focus == root) {
         focus = root;
         *x = 0;
         *y = 0;
@@ -275,22 +316,10 @@ static Window focused_window(Display *display, int *x, int *y,
         *depth = (unsigned int)DefaultDepth(display, DefaultScreen(display));
         return focus;
     }
-    Window parent = None;
-    Window *children = NULL;
-    unsigned int nchildren = 0;
-    while (XQueryTree(display, focus, &root, &parent, &children, &nchildren) &&
-           parent != None && parent != root) {
-        if (children) {
-            XFree(children);
-            children = NULL;
-        }
-        focus = parent;
-    }
-    if (children) {
-        XFree(children);
-    }
-    if (focus == root ||
-        !XGetGeometry(display, focus, &root, x, y, w, h, border, depth)) {
+    XWindowAttributes attributes;
+    if (!XGetWindowAttributes(display, focus, &attributes) ||
+        attributes.map_state != IsViewable ||
+        attributes.width <= 0 || attributes.height <= 0) {
         *x = 0;
         *y = 0;
         *w = (unsigned int)DisplayWidth(display, DefaultScreen(display));
@@ -299,9 +328,33 @@ static Window focused_window(Display *display, int *x, int *y,
         *depth = (unsigned int)DefaultDepth(display, DefaultScreen(display));
         return root;
     }
+    *w = (unsigned int)attributes.width;
+    *h = (unsigned int)attributes.height;
+    *border = (unsigned int)attributes.border_width;
+    *depth = (unsigned int)attributes.depth;
     *x = 0;
     *y = 0;
     return focus;
+}
+
+static Window chosen_window_geometry(Display *display, Window chosen,
+                                     unsigned int *w, unsigned int *h,
+                                     unsigned int *border,
+                                     unsigned int *depth) {
+    Window root = DefaultRootWindow(display);
+    Window target = root_child(display, chosen);
+    XWindowAttributes attributes;
+    XSync(display, False);
+    if (target == root || !XGetWindowAttributes(display, target, &attributes) ||
+        attributes.map_state != IsViewable ||
+        attributes.width <= 0 || attributes.height <= 0) {
+        return root;
+    }
+    *w = (unsigned int)attributes.width;
+    *h = (unsigned int)attributes.height;
+    *border = (unsigned int)attributes.border_width;
+    *depth = (unsigned int)attributes.depth;
+    return target;
 }
 
 /* Capture a window into an XImage. */
@@ -311,7 +364,8 @@ static XImage *capture_window(Display *display, Window window, int x, int y,
 }
 
 /* Take one screenshot and write it. Returns 0 on success. */
-static int take_screenshot(Display *display, const SsConfig *config) {
+static int take_screenshot(Display *display, const SsConfig *config,
+                           Window chosen_window_id) {
     char dir[SS_TEXT_LENGTH];
     expand_tilde(dir, sizeof(dir), config->save_dir);
     if (ensure_directory(dir) != 0) {
@@ -326,7 +380,12 @@ static int take_screenshot(Display *display, const SsConfig *config) {
     Window root = DefaultRootWindow(display);
     Window window = root;
     if (config->capture_focused) {
-        window = focused_window(display, &x, &y, &w, &h, &border, &depth);
+        if (chosen_window_id != None) {
+            window = chosen_window_geometry(display, chosen_window_id,
+                                            &w, &h, &border, &depth);
+        } else {
+            window = focused_window(display, &x, &y, &w, &h, &border, &depth);
+        }
     }
     if (w == 0 || h == 0) {
         w = (unsigned int)DisplayWidth(display, DefaultScreen(display));
@@ -345,10 +404,30 @@ static int take_screenshot(Display *display, const SsConfig *config) {
     }
 
     char path[SS_TEXT_LENGTH];
-    screenshot_filename(path, sizeof(path), dir, config->format);
+    int fd = open_screenshot_file(path, sizeof(path), dir, config->format);
+    if (fd < 0) {
+        fprintf(stderr,
+                "gnuchanscreenshot: could not create a unique screenshot file "
+                "in %s\n", dir);
+        return -1;
+    }
+    FILE *file = fdopen(fd, "wb");
+    if (!file) {
+        close(fd);
+        unlink(path);
+        fprintf(stderr,
+                "gnuchanscreenshot: could not open the screenshot file\n");
+        return -1;
+    }
     int rc = config->format == SS_FORMAT_JPEG
-                 ? write_jpeg(path, image, config->quality)
-                 : write_png(path, image);
+                 ? write_jpeg(file, image, config->quality)
+                 : write_png(file, image);
+    if (fclose(file) != 0) {
+        rc = -1;
+    }
+    if (rc != 0) {
+        unlink(path);
+    }
     XDestroyImage(image);
     if (rc != 0) {
         fprintf(stderr,
@@ -381,6 +460,8 @@ typedef struct SsSettingsUi {
     int capture_focused;
     int settings_window;
     int focused_field;
+    Window initial_target;
+    Window chosen_target;
     char status[128];
 } SsSettingsUi;
 
@@ -404,16 +485,28 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
         "Save directory",
         "Image format",
         "JPEG quality (click left/right)",
-        "Alt+P capture",
+        "Capture target",
         "Print opens settings",
     };
     const char *values[] = {
         ui->save_dir_text,
         ui->format_png ? "PNG" : "JPEG",
         NULL,
-        ui->capture_focused ? "Focused window" : "Whole screen",
+        ui->chosen_target != None ? "Chosen window" :
+            (ui->capture_focused ? "Focused window" : "Whole screen"),
         ui->settings_window ? "Enabled" : "Disabled",
     };
+    char target_label[48];
+    Window displayed_target = ui->chosen_target != None
+                                  ? ui->chosen_target : ui->initial_target;
+    if (displayed_target == None ||
+        displayed_target == DefaultRootWindow(ui->display)) {
+        snprintf(target_label, sizeof(target_label), "Whole screen");
+    } else {
+        snprintf(target_label, sizeof(target_label), "%s 0x%lx",
+                 ui->chosen_target != None ? "Chosen" : "Focused",
+                 (unsigned long)displayed_target);
+    }
     for (int i = 0; i < 5; i++) {
         int y = yy + i * 48;
         XSetForeground(ui->display, ui->gc,
@@ -425,28 +518,42 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
         if (i == 2) {
             snprintf(line, sizeof(line), "%d", ui->quality);
             ss_settings_draw_text(ui, 350, y, line, 0xd8c8ed);
+        } else if (i == 3 &&
+                   (ui->capture_focused || ui->chosen_target != None)) {
+            ss_settings_draw_text(ui, 280, y, target_label, 0xd8c8ed);
         } else {
             ss_settings_draw_text(ui, 280, y, values[i], 0xd8c8ed);
         }
     }
 
     XSetForeground(ui->display, ui->gc, 0x65428a);
+    XFillRectangle(ui->display, ui->window, ui->gc, 16, 330, 112, 38);
+    XFillRectangle(ui->display, ui->window, ui->gc, 140, 330, 112, 38);
     XFillRectangle(ui->display, ui->window, ui->gc, 280, 330, 100, 38);
     XFillRectangle(ui->display, ui->window, ui->gc, 390, 330, 94, 38);
     XSetForeground(ui->display, ui->gc, 0xf5eaff);
+    XDrawString(ui->display, ui->window, ui->gc, 26, 354, "Choose window", 13);
+    XDrawString(ui->display, ui->window, ui->gc, 169, 354, "Capture", 7);
     XDrawString(ui->display, ui->window, ui->gc, 307, 354, "Cancel", 6);
     XDrawString(ui->display, ui->window, ui->gc, 416, 354, "Save", 4);
     if (ui->status[0]) {
-        ss_settings_draw_text(ui, 20, 397, ui->status, 0xff6b8a);
+        ss_settings_draw_text(ui, 20, 397, ui->status,
+                              ui->chosen_target != None ? 0x8fe6a2 : 0xff6b8a);
     }
 }
 
 static int ss_settings_save(SsSettingsUi *ui) {
-    /* Write the settings back as a script file. */
+    /* Write a Key = value config, atomically, so a save cannot be lost to a
+       partial write or silently reset by the next install. */
     char path[SS_TEXT_LENGTH];
     ss_config_path(path, sizeof(path));
     if (!path[0]) {
         snprintf(ui->status, sizeof(ui->status), "Cannot find config directory");
+        return -1;
+    }
+    if (!ui->save_dir_text[0]) {
+        snprintf(ui->status, sizeof(ui->status),
+                 "Save directory cannot be empty");
         return -1;
     }
     if (strchr(ui->save_dir_text, '"') || strchr(ui->save_dir_text, '\\')) {
@@ -468,37 +575,87 @@ static int ss_settings_save(SsSettingsUi *ui) {
         }
     }
 
-    FILE *f = fopen(path, "w");
+    char temporary[SS_TEXT_LENGTH];
+    if (snprintf(temporary, sizeof(temporary), "%s.new", path) >=
+        (int)sizeof(temporary)) {
+        snprintf(ui->status, sizeof(ui->status), "Settings path is too long");
+        return -1;
+    }
+    FILE *f = fopen(temporary, "w");
     if (!f) {
         snprintf(ui->status, sizeof(ui->status), "Cannot write settings file");
         return -1;
     }
 
-    fprintf(f, "# ~/.config/GnuChanScreenShoot/GnuChanScreenShoot.py\n");
-    fprintf(f, "# Written by GnuChanScreenShoot settings window.\n");
-    fprintf(f, "\n");
-    fprintf(f, "gcl_Screenshot.Settings(\n");
-    fprintf(f, "    SaveDir=\"%s\",\n", ui->save_dir_text);
-    fprintf(f, "    Format=\"%s\",\n",
+    fprintf(f, "# ~/.config/GnuChanScreenShoot/GnuChanScreenShoot.conf\n");
+    fprintf(f, "SaveDir = \"%s\"\n", ui->save_dir_text);
+    fprintf(f, "Format = \"%s\"\n",
             ui->format_png ? "png" : "jpeg");
-    fprintf(f, "    Quality=%d,\n", ui->quality);
-    fprintf(f, "    CaptureFocused=%s,\n",
+    fprintf(f, "Quality = %d\n", ui->quality);
+    fprintf(f, "CaptureFocused = %s\n",
             ui->capture_focused ? "True" : "False");
-    fprintf(f, "    SettingsWindow=%s,\n",
+    fprintf(f, "SettingsWindow = %s\n",
             ui->settings_window ? "True" : "False");
-    fprintf(f, ")\n");
+    int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0) {
-        snprintf(ui->status, sizeof(ui->status), "Cannot finish settings file");
+        ok = 0;
+    }
+    if (!ok || rename(temporary, path) != 0) {
+        unlink(temporary);
+        snprintf(ui->status, sizeof(ui->status),
+                 "Cannot finish settings file");
         return -1;
     }
     ui->status[0] = '\0';
     return 0;
 }
 
+static Window select_window(Display *display, Window root, Window settings) {
+    Window settings_root = root_child(display, settings);
+    if (XGrabPointer(display, root, False, ButtonPressMask,
+                     GrabModeAsync, GrabModeAsync, None, None,
+                     CurrentTime) != GrabSuccess) {
+        return None;
+    }
+    XFlush(display);
+    while (!s_should_stop) {
+        XEvent event;
+        XNextEvent(display, &event);
+        if (event.type == KeyPress &&
+            XLookupKeysym(&event.xkey, 0) == XK_Escape) {
+            XUngrabPointer(display, CurrentTime);
+            XFlush(display);
+            return None;
+        }
+        if (event.type != ButtonPress) {
+            continue;
+        }
+        Window root_return = None;
+        Window child = None;
+        int root_x, root_y, window_x, window_y;
+        unsigned int mask;
+        Window target = None;
+        if (XQueryPointer(display, root, &root_return, &child,
+                          &root_x, &root_y, &window_x, &window_y, &mask) &&
+            child != None) {
+            target = root_child(display, child);
+        }
+        if (target != settings_root && target != root) {
+            XUngrabPointer(display, CurrentTime);
+            XFlush(display);
+            return target;
+        }
+    }
+    XUngrabPointer(display, CurrentTime);
+    XFlush(display);
+    return None;
+}
+
 /* Open the settings window, run until the user closes it or the idle timer
    expires. Returns 0 on a normal close. */
 static int run_settings_window(Display *display, int screen,
-                               const SsConfig *config) {
+                               const SsConfig *config, int capture_mode,
+                               Window initial_target) {
     int width = 500;
     int height = 420;
     Window root = RootWindow(display, screen);
@@ -525,6 +682,7 @@ static int run_settings_window(Display *display, int screen,
     ui.capture_focused = config->capture_focused;
     ui.settings_window = config->settings_window;
     ui.focused_field = 0;
+    ui.initial_target = initial_target;
 
     ui.window = XCreateSimpleWindow(display, root, x, y,
                                     (unsigned int)width, (unsigned int)height,
@@ -543,7 +701,9 @@ static int run_settings_window(Display *display, int screen,
                  ExposureMask | KeyPressMask | ButtonPressMask |
                  StructureNotifyMask);
     XMapWindow(display, ui.window);
-    XStoreName(display, ui.window, "GnuChanScreenShoot — settings");
+    XStoreName(display, ui.window, capture_mode
+                                     ? "GnuChanScreenShoot — capture"
+                                     : "GnuChanScreenShoot — settings");
     XFlush(display);
 
     /* Idle timer: close after SS_SETTINGS_IDLE_MS of no input. */
@@ -612,7 +772,43 @@ static int run_settings_window(Display *display, int screen,
             }
             case ButtonPress: {
                 int y = event.xbutton.y;
-                if (y >= 330 && event.xbutton.x >= 390) {
+                if (y >= 330 && event.xbutton.x < 128) {
+                    snprintf(ui.status, sizeof(ui.status),
+                             "Click a window to choose it");
+                    ss_settings_redraw(&ui);
+                    XFlush(display);
+                    Window selected = select_window(display, root, ui.window);
+                    if (selected != None) {
+                        ui.chosen_target = selected;
+                        snprintf(ui.status, sizeof(ui.status),
+                                 "Window chosen; size is read at capture time");
+                    } else {
+                        snprintf(ui.status, sizeof(ui.status),
+                                 "Could not choose a window");
+                    }
+                } else if (y >= 330 && event.xbutton.x < 260 &&
+                           event.xbutton.x >= 140) {
+                    SsConfig capture = *config;
+                    snprintf(capture.save_dir, sizeof(capture.save_dir), "%s",
+                             ui.save_dir_text);
+                    capture.format = ui.format_png ? SS_FORMAT_PNG
+                                                   : SS_FORMAT_JPEG;
+                    capture.quality = ui.quality;
+                    capture.capture_focused = ui.capture_focused ||
+                                              ui.chosen_target != None;
+                    capture.settings_window = ui.settings_window;
+                    Window target = ui.chosen_target != None
+                                        ? ui.chosen_target
+                                        : (ui.capture_focused
+                                               ? ui.initial_target
+                                               : None);
+                    if (take_screenshot(display, &capture, target) == 0) {
+                        ui.done = 1;
+                    } else {
+                        snprintf(ui.status, sizeof(ui.status),
+                                 "Capture failed; adjust target and retry");
+                    }
+                } else if (y >= 330 && event.xbutton.x >= 390) {
                     if (ss_settings_save(&ui) == 0) {
                         ui.done = 1;
                     }
@@ -633,6 +829,7 @@ static int run_settings_window(Display *display, int screen,
                 } else if (y < 248 && y >= 200) {
                     ui.focused_field = 3;
                     ui.capture_focused = !ui.capture_focused;
+                    ui.chosen_target = None;
                 } else if (y < 296 && y >= 248) {
                     ui.focused_field = 4;
                     ui.settings_window = !ui.settings_window;
@@ -660,24 +857,27 @@ static int run_settings_window(Display *display, int screen,
 int main(int argc, char **argv) {
     int do_once = 0;
     int do_settings = 0;
+    int do_capture = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--once") == 0) {
             do_once = 1;
         } else if (strcmp(argv[i], "--settings") == 0) {
             do_settings = 1;
+        } else if (strcmp(argv[i], "--capture") == 0) {
+            do_capture = 1;
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("GnuChanScreenShoot %s\n", GNUCHANSCREENSHOOT_VERSION);
             return 0;
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("usage: GnuChanScreenShoot [--once] [--settings] "
+                   "[--capture] "
                    "[--version]\n"
                    "\n"
-                   "Alt+P captures the focused window (or the whole screen)\n"
-                   "and writes it to the save directory. Print/SysRq opens\n"
-                   "the settings window. The settings live in\n"
-                   "~/.config/GnuChanScreenShoot/GnuChanScreenShoot.py\n"
-                   "and are edited by GnuChanSettings.\n");
+                   "Alt+P opens the detailed capture window. Choose a window\n"
+                   "or use the focused window (or whole screen), then save.\n"
+                   "Print/SysRq opens settings. Settings live in\n"
+                   "~/.config/GnuChanScreenShoot/GnuChanScreenShoot.conf.\n");
             return 0;
         } else {
             fprintf(stderr, "gnuchanscreenshot: unknown argument '%s'\n",
@@ -700,7 +900,22 @@ int main(int argc, char **argv) {
             return 1;
         }
         int screen = DefaultScreen(display);
-        run_settings_window(display, screen, &config);
+        Window initial_target = current_focus(display);
+        run_settings_window(display, screen, &config, 0, initial_target);
+        XCloseDisplay(display);
+        return 0;
+    }
+
+    if (do_capture) {
+        Display *display = XOpenDisplay(NULL);
+        if (!display) {
+            fprintf(stderr,
+                    "gnuchanscreenshot: cannot open the X display\n");
+            return 1;
+        }
+        int screen = DefaultScreen(display);
+        Window initial_target = current_focus(display);
+        run_settings_window(display, screen, &config, 1, initial_target);
         XCloseDisplay(display);
         return 0;
     }
@@ -712,7 +927,7 @@ int main(int argc, char **argv) {
                     "gnuchanscreenshot: cannot open the X display\n");
             return 1;
         }
-        int rc = take_screenshot(display, &config);
+        int rc = take_screenshot(display, &config, None);
         XCloseDisplay(display);
         return rc;
     }
@@ -759,6 +974,9 @@ int main(int argc, char **argv) {
         grabbed = 1;
     }
 
+    /* Grab errors are delivered asynchronously by Xlib. Drain them before
+       deciding that the daemon owns its hotkeys. */
+    XSync(display, False);
     if (s_xerror != 0 || !grabbed) {
         fprintf(stderr,
                 "gnuchanscreenshot: could not grab the hotkeys; another "
@@ -786,12 +1004,20 @@ int main(int argc, char **argv) {
 
             int is_alt = (state & Mod1Mask) != 0;
             if (code == kc_p && is_alt) {
-                take_screenshot(display, &config);
+                Window initial_target = current_focus(display);
+                run_settings_window(display, screen, &config, 1,
+                                    initial_target);
+                SsConfig fresh;
+                if (ss_config_load_default(&fresh) == 0) {
+                    config = fresh;
+                }
                 continue;
             }
             if (code == kc_print && config.settings_window) {
                 /* Ignore Alt modifier for Print — it is the plain key. */
-                run_settings_window(display, screen, &config);
+                Window initial_target = current_focus(display);
+                run_settings_window(display, screen, &config, 0,
+                                    initial_target);
                 /* Re-read the settings after the window closes, so an edit
                    takes effect at once. */
                 SsConfig fresh;

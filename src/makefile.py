@@ -9,7 +9,7 @@
 #
 # GnuChanScreenShoot is a C program, built against X11. It grabs two hotkeys
 # (Alt+P and Print/SysRq), captures the screen, and writes the image to the
-# save directory named in its settings script.
+# save directory named in its settings config.
 #
 # Debian only, on purpose.
 #
@@ -41,13 +41,11 @@ BIN_DIR = Path("/usr/local/bin")
 APPS_DIR = Path("/usr/share/applications")
 DESKTOP_FILE = APPS_DIR / "gnuchanscreenshot.desktop"
 
-# The settings file, installed into the user's own config directory. It is
-# replaced on every install, exactly as the other GnuChan programs' are: the
-# installer owns that file, and a machine installing a new build has to get the
-# settings that build ships with.
-CONFIG_SOURCE = ROOT / "GnuChanScreenShoot_config" / "GnuChanScreenShoot.py"
+# The settings file is installed into the user's config directory only when
+# neither a current .conf nor a legacy .py config already exists.
+CONFIG_SOURCE = ROOT / "GnuChanScreenShoot_config" / "GnuChanScreenShoot.conf"
 CONFIG_DIR_NAME = "GnuChanScreenShoot"
-CONFIG_FILE_NAME = "GnuChanScreenShoot.py"
+CONFIG_FILE_NAME = "GnuChanScreenShoot.conf"
 
 SOURCES = (
     "screenshot_config.c",
@@ -263,9 +261,8 @@ def install(binary: Path) -> None:
 def install_config() -> None:
     """Put the settings file where the program reads it.
 
-    The old file is removed first and the shipped one written in its place,
-    the same rule the other GnuChan programs' installers follow: the result is
-    what this build ships and nothing of what was there before.
+    Install defaults only for a new user. Replacing an existing config here
+    made settings appear to save but lose their values after an upgrade.
     """
     if not CONFIG_SOURCE.is_file():
         return
@@ -285,9 +282,10 @@ def install_config() -> None:
         )
 
     directory.mkdir(parents=True, exist_ok=True)
-    if file_target.exists():
-        file_target.unlink()
-        detail(f"removed the old {file_target}")
+    legacy_target = directory / "GnuChanScreenShoot.py"
+    if file_target.exists() or legacy_target.exists():
+        detail(f"kept existing settings in {directory}")
+        return
 
     shutil.copyfile(CONFIG_SOURCE, file_target)
     try:
