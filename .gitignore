@@ -1,0 +1,17 @@
+# The makefile writes build products outside the source tree.
+/_temp/
+*.o
+*.a
+*.so
+*.out
+
+# Python cache and editor/OS files
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

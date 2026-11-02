@@ -25,8 +25,8 @@
    unless the settings window changes it. */
 #define SS_SAVE_DIR_DEFAULT "~/Pictures"
 
-/* The default shortcuts: Alt+P opens the detailed capture window and
-   Print/SysRq opens settings. */
+/* The default shortcuts: Alt+P captures immediately and Print/SysRq opens
+   settings. */
 #define SS_HOTKEY_CAPTURE "Alt+P"
 #define SS_HOTKEY_SETTINGS "Print"
 

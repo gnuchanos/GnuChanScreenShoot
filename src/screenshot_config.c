@@ -10,7 +10,7 @@
  *         SaveDir="~/Pictures",     where screenshots are written
  *         Format="png",             "png" or "jpeg"
  *         Quality=90,               jpeg quality, 1..100
- *         CaptureFocused=True,      Alt+P grabs the focused window
+ *         CaptureFocused=True,      Alt+P captures the focused window
  *         SettingsWindow=True,      Print/SysRq opens the settings window
  *     )
  *

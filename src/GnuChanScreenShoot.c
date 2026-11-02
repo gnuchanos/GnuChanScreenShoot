@@ -8,8 +8,7 @@
  *
  * Two hotkeys, one job:
  *
- *   Alt+P        open the detailed capture window, choose a target and save
- *                the image to SaveDir.
+ *   Alt+P        capture the configured target and save the image to SaveDir.
  *   Print/SysRq  open an X11 window with the detailed settings: where
  *                screenshots go, which format, JPEG quality, whether Alt+P
  *                grabs the focused window or the whole screen.
@@ -459,6 +458,7 @@ typedef struct SsSettingsUi {
     int quality;       /* 1..100 */
     int capture_focused;
     int settings_window;
+    int capture_mode;
     int focused_field;
     Window initial_target;
     Window chosen_target;
@@ -477,8 +477,11 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
     XFillRectangle(ui->display, ui->window, ui->gc, 0, 0,
                    (unsigned int)ui->width, (unsigned int)ui->height);
     XSetForeground(ui->display, ui->gc, 0xb98aff);
-    XDrawString(ui->display, ui->window, ui->gc, 20, 34,
-                "GnuChanScreenShoot settings", 28);
+    const char *title = ui->capture_mode
+                            ? "GnuChanScreenShoot capture"
+                            : "GnuChanScreenShoot settings";
+    XDrawString(ui->display, ui->window, ui->gc, 20, 34, title,
+                (int)strlen(title));
     int yy = 78;
     char line[SS_TEXT_LENGTH];
     const char *labels[] = {
@@ -496,17 +499,6 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
             (ui->capture_focused ? "Focused window" : "Whole screen"),
         ui->settings_window ? "Enabled" : "Disabled",
     };
-    char target_label[48];
-    Window displayed_target = ui->chosen_target != None
-                                  ? ui->chosen_target : ui->initial_target;
-    if (displayed_target == None ||
-        displayed_target == DefaultRootWindow(ui->display)) {
-        snprintf(target_label, sizeof(target_label), "Whole screen");
-    } else {
-        snprintf(target_label, sizeof(target_label), "%s 0x%lx",
-                 ui->chosen_target != None ? "Chosen" : "Focused",
-                 (unsigned long)displayed_target);
-    }
     for (int i = 0; i < 5; i++) {
         int y = yy + i * 48;
         XSetForeground(ui->display, ui->gc,
@@ -518,9 +510,6 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
         if (i == 2) {
             snprintf(line, sizeof(line), "%d", ui->quality);
             ss_settings_draw_text(ui, 350, y, line, 0xd8c8ed);
-        } else if (i == 3 &&
-                   (ui->capture_focused || ui->chosen_target != None)) {
-            ss_settings_draw_text(ui, 280, y, target_label, 0xd8c8ed);
         } else {
             ss_settings_draw_text(ui, 280, y, values[i], 0xd8c8ed);
         }
@@ -681,6 +670,7 @@ static int run_settings_window(Display *display, int screen,
     ui.quality = config->quality;
     ui.capture_focused = config->capture_focused;
     ui.settings_window = config->settings_window;
+    ui.capture_mode = capture_mode;
     ui.focused_field = 0;
     ui.initial_target = initial_target;
 
@@ -874,9 +864,10 @@ int main(int argc, char **argv) {
                    "[--capture] "
                    "[--version]\n"
                    "\n"
-                   "Alt+P opens the detailed capture window. Choose a window\n"
-                   "or use the focused window (or whole screen), then save.\n"
-                   "Print/SysRq opens settings. Settings live in\n"
+                   "Alt+P captures the configured target immediately.\n"
+                   "Print/SysRq opens settings. Use --capture for the\n"
+                   "interactive target chooser.\n"
+                   "Settings live in\n"
                    "~/.config/GnuChanScreenShoot/GnuChanScreenShoot.conf.\n");
             return 0;
         } else {
@@ -1004,9 +995,7 @@ int main(int argc, char **argv) {
 
             int is_alt = (state & Mod1Mask) != 0;
             if (code == kc_p && is_alt) {
-                Window initial_target = current_focus(display);
-                run_settings_window(display, screen, &config, 1,
-                                    initial_target);
+                (void)take_screenshot(display, &config, None);
                 SsConfig fresh;
                 if (ss_config_load_default(&fresh) == 0) {
                     config = fresh;
