@@ -4,12 +4,12 @@
 # -----------------------------------------------------------------------------
 #     python3 makefile.py            build and install the program
 #     python3 makefile.py build      compile only
+#     python3 makefile.py test       build and run the focused tests
 #     python3 makefile.py run        compile and start on the current display
 #     python3 makefile.py uninstall  remove the binary and the desktop entry
 #
-# GnuChanScreenShoot is a C program, built against X11. It grabs two hotkeys
-# (Alt+P and Print/SysRq), captures the screen, and writes the image to the
-# save directory named in its settings config.
+# GnuChanScreenShoot is a C program, built against X11 and Xext. It grabs
+# Alt+P, Shift+Alt+P, and Print/SysRq, and needs xclip to publish captures.
 #
 # Debian only, on purpose.
 #
@@ -145,10 +145,14 @@ def missing_build_dependencies() -> list[str]:
         needed.append("pkg-config")
     if not x11_headers_present():
         needed.append("libx11-dev")
+    if not header_present("X11/extensions/shape.h"):
+        needed.append("libxext-dev")
     if not header_present("png.h"):
         needed.append("libpng-dev")
     if not header_present("jpeglib.h"):
         needed.append("libjpeg-dev")
+    if shutil.which("xclip") is None:
+        needed.append("xclip")
     return needed
 
 
@@ -200,13 +204,34 @@ def build() -> Path:
     ]
     command += [str(ROOT / name) for name in SOURCES]
     command += ["-o", str(output)]
-    command += [*libs, "-lpng", "-ljpeg"]
+    command += [*libs, "-lXext", "-lpng", "-ljpeg"]
 
     step("Building")
     if run(command, cwd=ROOT).returncode != 0:
         raise SystemExit("error: the build failed")
     detail(f"built {output}")
     return output
+
+
+def test() -> int:
+    check_sources()
+    ensure_build_dependencies()
+    BUILD.mkdir(parents=True, exist_ok=True)
+    test_binary = BUILD / "test_unique_capture_path"
+    cflags, libs = x11_flags()
+    command = [
+        "gcc", "-std=c99", "-Wall", "-Wextra", "-Wno-unused-parameter",
+        "-O2", "-D_DEFAULT_SOURCE", "-I", str(ROOT), *cflags,
+        str(ROOT / "tests" / "test_unique_capture_path.c"),
+        str(ROOT / "screenshot_config.c"),
+        str(ROOT / "ss_parser.c"),
+        "-o", str(test_binary), *libs, "-lXext", "-lpng", "-ljpeg",
+    ]
+    step("Building tests")
+    if run(command, cwd=ROOT).returncode != 0:
+        raise SystemExit("error: the test build failed")
+    step("Running tests")
+    return run([str(test_binary)], cwd=ROOT).returncode
 
 
 def desktop_entry() -> str:
@@ -325,7 +350,7 @@ def main() -> int:
         )
 
     action = sys.argv[1] if len(sys.argv) > 1 else "install"
-    known = ("install", "build", "run", "uninstall")
+    known = ("install", "build", "test", "run", "uninstall")
     if action not in known:
         print(f"error: unknown action '{action}'", file=sys.stderr)
         print("usage: python3 makefile.py [" + "|".join(known) + "]",
@@ -343,6 +368,9 @@ def main() -> int:
         binary = build()
         note(f"Built {binary}.")
         return 0
+
+    if action == "test":
+        return test()
 
     if action == "run":
         return run_program(build())

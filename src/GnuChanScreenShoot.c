@@ -8,10 +8,11 @@
  *
  * Two hotkeys, one job:
  *
- *   Alt+P        capture the configured target and save the image to SaveDir.
+ *   Alt+P        choose a window with the pointer, then save and copy it.
+ *   Shift+Alt+P  drag a screen region, then save and copy it.
  *   Print/SysRq  open an X11 window with the detailed settings: where
- *                screenshots go, which format, JPEG quality, whether Alt+P
- *                grabs the focused window or the whole screen.
+ *                screenshots go, which format, JPEG quality, and the default
+ *                target for non-interactive captures.
  *
  * The settings live in
  *   ~/.config/GnuChanScreenShoot/GnuChanScreenShoot.conf
@@ -31,6 +32,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <setjmp.h>
 #include <stdint.h>
@@ -39,6 +41,8 @@
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/cursorfont.h>
+#include <X11/extensions/shape.h>
 #include <jpeglib.h>
 #include <png.h>
 
@@ -100,6 +104,77 @@ static int ensure_directory(const char *path) {
         }
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        return -1;
+    }
+    return 0;
+}
+
+static int executable_in_path(const char *name) {
+    const char *path = getenv("PATH");
+    if (!path || !path[0]) {
+        return 0;
+    }
+
+    const char *entry = path;
+    while (1) {
+        const char *end = strchr(entry, ':');
+        size_t directory_length = end ? (size_t)(end - entry) : strlen(entry);
+        char candidate[PATH_MAX];
+        int written;
+        if (directory_length == 0) {
+            written = snprintf(candidate, sizeof(candidate), "%s", name);
+        } else {
+            written = snprintf(candidate, sizeof(candidate), "%.*s/%s",
+                               (int)directory_length, entry, name);
+        }
+        if (written > 0 && (size_t)written < sizeof(candidate) &&
+            access(candidate, X_OK) == 0) {
+            return 1;
+        }
+        if (!end) {
+            break;
+        }
+        entry = end + 1;
+    }
+    return 0;
+}
+
+static int require_clipboard_helper(void) {
+    if (executable_in_path("xclip")) {
+        return 0;
+    }
+    fprintf(stderr,
+            "gnuchanscreenshot: xclip is required to copy screenshots; "
+            "install the xclip package and try again\n");
+    return -1;
+}
+
+static int copy_to_clipboard(const char *path, SsFormat format) {
+    const char *mime = format == SS_FORMAT_JPEG ? "image/jpeg" : "image/png";
+    pid_t child = fork();
+    if (child < 0) {
+        fprintf(stderr, "gnuchanscreenshot: could not start xclip: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    if (child == 0) {
+        execlp("xclip", "xclip", "-selection", "clipboard", "-t", mime,
+               "-i", path, (char *)NULL);
+        _exit(127);
+    }
+
+    int status;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            fprintf(stderr, "gnuchanscreenshot: could not wait for xclip: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr,
+                "gnuchanscreenshot: xclip could not put the screenshot on "
+                "the X clipboard\n");
         return -1;
     }
     return 0;
@@ -347,7 +422,7 @@ static Window chosen_window_geometry(Display *display, Window chosen,
     if (target == root || !XGetWindowAttributes(display, target, &attributes) ||
         attributes.map_state != IsViewable ||
         attributes.width <= 0 || attributes.height <= 0) {
-        return root;
+        return None;
     }
     *w = (unsigned int)attributes.width;
     *h = (unsigned int)attributes.height;
@@ -362,15 +437,65 @@ static XImage *capture_window(Display *display, Window window, int x, int y,
     return XGetImage(display, window, x, y, w, h, AllPlanes, ZPixmap);
 }
 
-/* Take one screenshot and write it. Returns 0 on success. */
-static int take_screenshot(Display *display, const SsConfig *config,
-                           Window chosen_window_id) {
+static int save_screenshot(const SsConfig *config, XImage *image) {
     char dir[SS_TEXT_LENGTH];
     expand_tilde(dir, sizeof(dir), config->save_dir);
     if (ensure_directory(dir) != 0) {
         fprintf(stderr,
                 "gnuchanscreenshot: could not create save directory %s\n",
                 dir);
+        XDestroyImage(image);
+        return -1;
+    }
+
+    char path[SS_TEXT_LENGTH];
+    int fd = open_screenshot_file(path, sizeof(path), dir, config->format);
+    if (fd < 0) {
+        fprintf(stderr,
+                "gnuchanscreenshot: could not create a unique screenshot file "
+                "in %s\n", dir);
+        XDestroyImage(image);
+        return -1;
+    }
+    FILE *file = fdopen(fd, "wb");
+    if (!file) {
+        close(fd);
+        unlink(path);
+        fprintf(stderr,
+                "gnuchanscreenshot: could not open the screenshot file\n");
+        XDestroyImage(image);
+        return -1;
+    }
+    int rc = config->format == SS_FORMAT_JPEG
+                 ? write_jpeg(file, image, config->quality)
+                 : write_png(file, image);
+    if (fclose(file) != 0) {
+        rc = -1;
+    }
+    XDestroyImage(image);
+    if (rc != 0) {
+        unlink(path);
+        fprintf(stderr,
+                "gnuchanscreenshot: could not write %s\n", path);
+        return -1;
+    }
+    printf("gnuchanscreenshot: wrote %s\n", path);
+    fflush(stdout);
+    if (copy_to_clipboard(path, config->format) != 0) {
+        fprintf(stderr,
+                "gnuchanscreenshot: screenshot was saved but could not be "
+                "copied to the clipboard\n");
+        return -1;
+    }
+    printf("gnuchanscreenshot: copied to clipboard\n");
+    fflush(stdout);
+    return 0;
+}
+
+/* Take one screenshot and write it. Returns 0 on success. */
+static int take_screenshot(Display *display, const SsConfig *config,
+                           Window chosen_window_id) {
+    if (require_clipboard_helper() != 0) {
         return -1;
     }
 
@@ -382,6 +507,12 @@ static int take_screenshot(Display *display, const SsConfig *config,
         if (chosen_window_id != None) {
             window = chosen_window_geometry(display, chosen_window_id,
                                             &w, &h, &border, &depth);
+            if (window == None) {
+                fprintf(stderr,
+                        "gnuchanscreenshot: the selected window is no longer "
+                        "available; no screenshot was taken\n");
+                return -1;
+            }
         } else {
             window = focused_window(display, &x, &y, &w, &h, &border, &depth);
         }
@@ -401,41 +532,86 @@ static int take_screenshot(Display *display, const SsConfig *config,
                 "gnuchanscreenshot: could not read the screen\n");
         return -1;
     }
+    return save_screenshot(config, image);
+}
 
-    char path[SS_TEXT_LENGTH];
-    int fd = open_screenshot_file(path, sizeof(path), dir, config->format);
-    if (fd < 0) {
-        fprintf(stderr,
-                "gnuchanscreenshot: could not create a unique screenshot file "
-                "in %s\n", dir);
+static int take_region_screenshot(Display *display, const SsConfig *config,
+                                  int x, int y, unsigned int width,
+                                  unsigned int height) {
+    if (require_clipboard_helper() != 0) {
         return -1;
     }
-    FILE *file = fdopen(fd, "wb");
-    if (!file) {
-        close(fd);
-        unlink(path);
+    XImage *image = capture_window(display, DefaultRootWindow(display),
+                                   x, y, width, height);
+    if (!image) {
         fprintf(stderr,
-                "gnuchanscreenshot: could not open the screenshot file\n");
+                "gnuchanscreenshot: could not read the selected region; "
+                "no screenshot was taken\n");
         return -1;
     }
-    int rc = config->format == SS_FORMAT_JPEG
-                 ? write_jpeg(file, image, config->quality)
-                 : write_png(file, image);
-    if (fclose(file) != 0) {
-        rc = -1;
-    }
-    if (rc != 0) {
-        unlink(path);
-    }
-    XDestroyImage(image);
-    if (rc != 0) {
-        fprintf(stderr,
-                "gnuchanscreenshot: could not write %s\n", path);
+    return save_screenshot(config, image);
+}
+
+static int normalize_region(int start_x, int start_y, int end_x, int end_y,
+                            int screen_width, int screen_height,
+                            int *x, int *y, unsigned int *width,
+                            unsigned int *height) {
+    int left = start_x < end_x ? start_x : end_x;
+    int top = start_y < end_y ? start_y : end_y;
+    int right = start_x > end_x ? start_x : end_x;
+    int bottom = start_y > end_y ? start_y : end_y;
+    if (left < 0 || top < 0 || right > screen_width ||
+        bottom > screen_height || right <= left || bottom <= top) {
         return -1;
     }
-    printf("gnuchanscreenshot: wrote %s\n", path);
-    fflush(stdout);
+    *x = left;
+    *y = top;
+    *width = (unsigned int)(right - left);
+    *height = (unsigned int)(bottom - top);
     return 0;
+}
+
+static void region_overlay_update(Display *display, Window overlay,
+                                  int screen_width, int screen_height,
+                                  int pointer_x, int pointer_y,
+                                  int start_x, int start_y, int dragging) {
+    XRectangle rectangles[6];
+    int count = 0;
+    if (pointer_x < 0) pointer_x = 0;
+    if (pointer_y < 0) pointer_y = 0;
+    if (pointer_x >= screen_width) pointer_x = screen_width - 1;
+    if (pointer_y >= screen_height) pointer_y = screen_height - 1;
+    rectangles[count++] = (XRectangle){0, (short)pointer_y,
+                                        (unsigned short)screen_width, 1};
+    rectangles[count++] = (XRectangle){(short)pointer_x, 0, 1,
+                                        (unsigned short)screen_height};
+    if (dragging) {
+        int left = start_x < pointer_x ? start_x : pointer_x;
+        int top = start_y < pointer_y ? start_y : pointer_y;
+        int right = start_x > pointer_x ? start_x : pointer_x;
+        int bottom = start_y > pointer_y ? start_y : pointer_y;
+        unsigned short horizontal = (unsigned short)(right - left + 1);
+        unsigned short vertical = (unsigned short)(bottom - top + 1);
+        rectangles[count++] = (XRectangle){(short)left, (short)top,
+                                            horizontal, 2};
+        rectangles[count++] = (XRectangle){(short)left, (short)bottom,
+                                            horizontal, 2};
+        rectangles[count++] = (XRectangle){(short)left, (short)top,
+                                            2, vertical};
+        rectangles[count++] = (XRectangle){(short)right, (short)top,
+                                            2, vertical};
+    }
+    XShapeCombineRectangles(display, overlay, ShapeBounding, 0, 0, rectangles,
+                            count, ShapeSet, Unsorted);
+    XClearWindow(display, overlay);
+}
+
+static Window selection_key_window(Display *display, Window root) {
+    XSetWindowAttributes attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.event_mask = KeyPressMask;
+    return XCreateWindow(display, root, 0, 0, 1, 1, 0, 0, InputOnly,
+                         CopyFromParent, CWEventMask, &attributes);
 }
 
 /* --- settings window ------------------------------------------------------ */
@@ -488,7 +664,7 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
         "Save directory",
         "Image format",
         "JPEG quality (click left/right)",
-        "Capture target",
+        "Default capture target",
         "Print opens settings",
     };
     const char *values[] = {
@@ -601,43 +777,175 @@ static int ss_settings_save(SsSettingsUi *ui) {
 
 static Window select_window(Display *display, Window root, Window settings) {
     Window settings_root = root_child(display, settings);
-    if (XGrabPointer(display, root, False, ButtonPressMask,
-                     GrabModeAsync, GrabModeAsync, None, None,
-                     CurrentTime) != GrabSuccess) {
+    Cursor cursor = XCreateFontCursor(display, XC_crosshair);
+    Window key_window = selection_key_window(display, root);
+    if (key_window != None) {
+        XMapWindow(display, key_window);
+    }
+    if (cursor == None || key_window == None ||
+        XGrabPointer(display, root, False, ButtonPressMask,
+                     GrabModeAsync, GrabModeAsync, None, cursor,
+                     CurrentTime) != GrabSuccess ||
+        XGrabKeyboard(display, key_window, False, GrabModeAsync,
+                      GrabModeAsync, CurrentTime) != GrabSuccess) {
+        XUngrabPointer(display, CurrentTime);
+        XUngrabKeyboard(display, CurrentTime);
+        if (key_window != None) XDestroyWindow(display, key_window);
+        if (cursor != None) XFreeCursor(display, cursor);
+        fprintf(stderr,
+                "gnuchanscreenshot: could not start window selection\n");
         return None;
     }
     XFlush(display);
-    while (!s_should_stop) {
+    Window target = None;
+    int done = 0;
+    while (!done && !s_should_stop) {
         XEvent event;
         XNextEvent(display, &event);
         if (event.type == KeyPress &&
             XLookupKeysym(&event.xkey, 0) == XK_Escape) {
-            XUngrabPointer(display, CurrentTime);
-            XFlush(display);
-            return None;
+            done = 1;
+            continue;
         }
         if (event.type != ButtonPress) {
+            continue;
+        }
+        if (event.xbutton.button != Button1) {
+            done = 1;
             continue;
         }
         Window root_return = None;
         Window child = None;
         int root_x, root_y, window_x, window_y;
         unsigned int mask;
-        Window target = None;
         if (XQueryPointer(display, root, &root_return, &child,
                           &root_x, &root_y, &window_x, &window_y, &mask) &&
             child != None) {
             target = root_child(display, child);
         }
-        if (target != settings_root && target != root) {
-            XUngrabPointer(display, CurrentTime);
-            XFlush(display);
-            return target;
+        if (target == settings_root || target == root) {
+            target = None;
         }
+        done = 1;
     }
     XUngrabPointer(display, CurrentTime);
+    XUngrabKeyboard(display, CurrentTime);
+    XDestroyWindow(display, key_window);
+    XFreeCursor(display, cursor);
     XFlush(display);
-    return None;
+    return target;
+}
+
+static int select_region(Display *display, Window root, int screen,
+                         int *x, int *y, unsigned int *width,
+                         unsigned int *height) {
+    int event_base, error_base;
+    if (!XShapeQueryExtension(display, &event_base, &error_base)) {
+        fprintf(stderr,
+                "gnuchanscreenshot: the X Shape extension is required for "
+                "region selection\n");
+        return -1;
+    }
+
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+    XSetWindowAttributes attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.override_redirect = True;
+    attributes.background_pixel = WhitePixel(display, screen);
+    Window overlay = XCreateWindow(
+        display, root, 0, 0, (unsigned int)screen_width,
+        (unsigned int)screen_height, 0, CopyFromParent, InputOutput,
+        CopyFromParent, CWOverrideRedirect | CWBackPixel, &attributes);
+    Cursor cursor = XCreateFontCursor(display, XC_crosshair);
+    Window key_window = selection_key_window(display, root);
+    if (overlay == None || cursor == None || key_window == None) {
+        if (overlay != None) XDestroyWindow(display, overlay);
+        if (key_window != None) XDestroyWindow(display, key_window);
+        if (cursor != None) XFreeCursor(display, cursor);
+        fprintf(stderr,
+                "gnuchanscreenshot: could not create the region selector\n");
+        return -1;
+    }
+
+    XColor color, exact;
+    if (XAllocNamedColor(display, DefaultColormap(display, screen),
+                         "#ff4fd8", &color, &exact)) {
+        XSetWindowBackground(display, overlay, color.pixel);
+    }
+    int initial_x = screen_width / 2;
+    int initial_y = screen_height / 2;
+    region_overlay_update(display, overlay, screen_width, screen_height,
+                          initial_x, initial_y, 0, 0, 0);
+    XMapRaised(display, overlay);
+    XMapWindow(display, key_window);
+    XFlush(display);
+
+    int pointer_grab = XGrabPointer(
+        display, root, False,
+        ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+        GrabModeAsync, GrabModeAsync, None, cursor, CurrentTime);
+    int keyboard_grab = pointer_grab == GrabSuccess
+                            ? XGrabKeyboard(display, key_window, False,
+                                            GrabModeAsync, GrabModeAsync,
+                                            CurrentTime)
+                            : GrabNotViewable;
+    if (pointer_grab != GrabSuccess || keyboard_grab != GrabSuccess) {
+        XUngrabPointer(display, CurrentTime);
+        XUngrabKeyboard(display, CurrentTime);
+        XDestroyWindow(display, overlay);
+        XDestroyWindow(display, key_window);
+        XFreeCursor(display, cursor);
+        XFlush(display);
+        fprintf(stderr,
+                "gnuchanscreenshot: could not start region selection\n");
+        return -1;
+    }
+
+    int start_x = 0, start_y = 0, end_x = 0, end_y = 0;
+    int dragging = 0;
+    int selected = 0;
+    while (!s_should_stop) {
+        XEvent event;
+        XNextEvent(display, &event);
+        if (event.type == KeyPress &&
+            XLookupKeysym(&event.xkey, 0) == XK_Escape) {
+            break;
+        }
+        if (event.type == ButtonPress) {
+            if (event.xbutton.button != Button1) {
+                break;
+            }
+            start_x = event.xbutton.x_root;
+            start_y = event.xbutton.y_root;
+            end_x = start_x;
+            end_y = start_y;
+            dragging = 1;
+        } else if (event.type == MotionNotify) {
+            end_x = event.xmotion.x_root;
+            end_y = event.xmotion.y_root;
+        } else if (event.type == ButtonRelease && dragging) {
+            end_x = event.xbutton.x_root;
+            end_y = event.xbutton.y_root;
+            selected = normalize_region(start_x, start_y, end_x, end_y,
+                                        screen_width, screen_height,
+                                        x, y, width, height) == 0;
+            break;
+        } else {
+            continue;
+        }
+        region_overlay_update(display, overlay, screen_width, screen_height,
+                              end_x, end_y, start_x, start_y, dragging);
+        XFlush(display);
+    }
+
+    XUngrabPointer(display, CurrentTime);
+    XUngrabKeyboard(display, CurrentTime);
+    XDestroyWindow(display, overlay);
+    XDestroyWindow(display, key_window);
+    XFreeCursor(display, cursor);
+    XFlush(display);
+    return selected ? 1 : 0;
 }
 
 /* Open the settings window, run until the user closes it or the idle timer
@@ -792,11 +1100,14 @@ static int run_settings_window(Display *display, int screen,
                                         : (ui.capture_focused
                                                ? ui.initial_target
                                                : None);
-                    if (take_screenshot(display, &capture, target) == 0) {
+                    if (require_clipboard_helper() != 0) {
+                        snprintf(ui.status, sizeof(ui.status),
+                                 "Install xclip for clipboard capture");
+                    } else if (take_screenshot(display, &capture, target) == 0) {
                         ui.done = 1;
                     } else {
                         snprintf(ui.status, sizeof(ui.status),
-                                 "Capture failed; adjust target and retry");
+                                 "Capture failed; see error output");
                     }
                 } else if (y >= 330 && event.xbutton.x >= 390) {
                     if (ss_settings_save(&ui) == 0) {
@@ -864,9 +1175,9 @@ int main(int argc, char **argv) {
                    "[--capture] "
                    "[--version]\n"
                    "\n"
-                   "Alt+P captures the configured target immediately.\n"
+                   "Alt+P selects a window; Shift+Alt+P selects a region.\n"
                    "Print/SysRq opens settings. Use --capture for the\n"
-                   "interactive target chooser.\n"
+                   "settings capture chooser.\n"
                    "Settings live in\n"
                    "~/.config/GnuChanScreenShoot/GnuChanScreenShoot.conf.\n");
             return 0;
@@ -950,7 +1261,7 @@ int main(int argc, char **argv) {
     s_xerror = 0;
     XSetErrorHandler(error_handler);
 
-    /* Grab Alt+P for screenshot. Also grab Alt+Shift+P as a fallback. */
+    /* Alt+P selects a window; Alt+Shift+P selects a screen region. */
     int grabbed = 0;
     unsigned int mods_p[] = {Mod1Mask, Mod1Mask | ShiftMask};
     for (int m = 0; m < 2; m++) {
@@ -995,7 +1306,33 @@ int main(int argc, char **argv) {
 
             int is_alt = (state & Mod1Mask) != 0;
             if (code == kc_p && is_alt) {
-                (void)take_screenshot(display, &config, None);
+                if (require_clipboard_helper() == 0) {
+                    if (state & ShiftMask) {
+                        int x = 0, y = 0;
+                        unsigned int width = 0, height = 0;
+                        int selected = select_region(display, root, screen,
+                                                     &x, &y, &width, &height);
+                        if (selected > 0) {
+                            (void)take_region_screenshot(
+                                display, &config, x, y, width, height);
+                        } else if (selected == 0) {
+                            fprintf(stderr,
+                                    "gnuchanscreenshot: region selection "
+                                    "cancelled; no screenshot was taken\n");
+                        }
+                    } else {
+                        Window selected = select_window(display, root, None);
+                        if (selected != None) {
+                            SsConfig capture = config;
+                            capture.capture_focused = 1;
+                            (void)take_screenshot(display, &capture, selected);
+                        } else {
+                            fprintf(stderr,
+                                    "gnuchanscreenshot: window selection "
+                                    "cancelled; no screenshot was taken\n");
+                        }
+                    }
+                }
                 SsConfig fresh;
                 if (ss_config_load_default(&fresh) == 0) {
                     config = fresh;

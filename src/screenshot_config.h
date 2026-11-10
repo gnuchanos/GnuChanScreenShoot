@@ -21,12 +21,12 @@
 /* The largest path a settings file may name. */
 #define SS_TEXT_LENGTH 256
 
-/* Where screenshots are saved. Alt+P writes here; Print/SysRq writes here too
-   unless the settings window changes it. */
+/* Where screenshots are saved. Alt+P, Shift+Alt+P, and settings captures use
+   this directory unless the settings window changes it. */
 #define SS_SAVE_DIR_DEFAULT "~/Pictures"
 
-/* The default shortcuts: Alt+P captures immediately and Print/SysRq opens
-   settings. */
+/* The default shortcuts: Alt+P selects a window, Shift+Alt+P selects a region,
+   and Print/SysRq opens settings. */
 #define SS_HOTKEY_CAPTURE "Alt+P"
 #define SS_HOTKEY_SETTINGS "Print"
 
@@ -75,7 +75,7 @@ typedef struct SsConfig {
     /* JPEG quality, 1..100. Ignored for PNG. */
     int quality;
 
-    /* Whether Alt+P captures the focused window (1) or the whole screen (0). */
+    /* Whether non-interactive captures target the focused window or screen. */
     int capture_focused;
 
     /* Whether the settings window opens on Print/SysRq. */
