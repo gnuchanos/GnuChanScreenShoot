@@ -39,13 +39,13 @@ int main(void) {
     char first_path[SS_TEXT_LENGTH];
     char second_path[SS_TEXT_LENGTH];
     int first_fd = open_screenshot_file(first_path, sizeof(first_path),
-                                        "src/tests", SS_FORMAT_PNG);
+                                        "tests", SS_FORMAT_PNG);
     assert(first_fd >= 0);
     assert(write(first_fd, "keep", 4) == 4);
     close(first_fd);
 
     int second_fd = open_screenshot_file(second_path, sizeof(second_path),
-                                         "src/tests", SS_FORMAT_PNG);
+                                         "tests", SS_FORMAT_PNG);
     assert(second_fd >= 0);
     assert(strcmp(first_path, second_path) != 0);
 
