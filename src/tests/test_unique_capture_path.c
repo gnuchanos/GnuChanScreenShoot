@@ -5,6 +5,12 @@
 #include <assert.h>
 
 int main(void) {
+    assert(hotkey_modifier_mask(Mod1Mask, 0) == Mod1Mask);
+    assert(hotkey_modifier_mask(Mod1Mask, 1) == (Mod1Mask | LockMask));
+    assert(hotkey_modifier_mask(Mod1Mask | ShiftMask, 2) ==
+           (Mod1Mask | ShiftMask | Mod2Mask));
+    assert(hotkey_modifier_mask(0, 4) == Mod5Mask);
+
     assert(ensure_directory("") == -1);
 
     const char *path = getenv("PATH");

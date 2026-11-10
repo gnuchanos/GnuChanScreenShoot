@@ -61,11 +61,42 @@ static void handle_signal(int signum) {
 }
 
 static int s_xerror = 0;
+static int s_grab_error = 0;
 
 static int error_handler(Display *dpy, XErrorEvent *ev) {
     (void)dpy;
     s_xerror = ev->error_code;
     return 0;
+}
+
+static unsigned int hotkey_modifier_mask(unsigned int base, unsigned int variant) {
+    unsigned int mask = base;
+    if (variant & 1u) mask |= LockMask;
+    if (variant & 2u) mask |= Mod2Mask;
+    if (variant & 4u) mask |= Mod5Mask;
+    return mask;
+}
+
+static int grab_key_variants(Display *display, KeyCode keycode,
+                             unsigned int base, Window root) {
+    if (keycode == 0) {
+        return 0;
+    }
+
+    int grabbed = 0;
+    for (unsigned int variant = 0; variant < 8; variant++) {
+        unsigned int modifiers = hotkey_modifier_mask(base, variant);
+        s_xerror = 0;
+        XGrabKey(display, keycode, modifiers, root, True,
+                 GrabModeAsync, GrabModeAsync);
+        XSync(display, False);
+        if (s_xerror == 0) {
+            grabbed++;
+        } else {
+            s_grab_error = s_xerror;
+        }
+    }
+    return grabbed;
 }
 
 /* --- paths and filenames -------------------------------------------------- */
@@ -1259,32 +1290,35 @@ int main(int argc, char **argv) {
 
     /* Set up error handler so BadAccess from XGrabKey is captured. */
     s_xerror = 0;
+    s_grab_error = 0;
     XSetErrorHandler(error_handler);
 
-    /* Alt+P selects a window; Alt+Shift+P selects a screen region. */
-    int grabbed = 0;
-    unsigned int mods_p[] = {Mod1Mask, Mod1Mask | ShiftMask};
-    for (int m = 0; m < 2; m++) {
-        if (XGrabKey(display, kc_p, mods_p[m], root, True,
-                     GrabModeAsync, GrabModeAsync) == GrabSuccess) {
-            grabbed = 1;
-        }
-    }
-    /* Grab Print/SysRq for settings window (no Alt required). */
-    if (XGrabKey(display, kc_print, 0, root, True,
-                 GrabModeAsync, GrabModeAsync) == GrabSuccess) {
-        grabbed = 1;
-    }
+    /* NumLock and CapsLock alter X11's modifier state even when they are not
+       part of the shortcut. Grab every lock-state variant so the keys remain
+       reliable regardless of the user's keyboard state. */
+    int grab_alt_p = grab_key_variants(display, kc_p, Mod1Mask, root);
+    int grab_shift_alt_p =
+        grab_key_variants(display, kc_p, Mod1Mask | ShiftMask, root);
+    int grab_print = config.settings_window
+                         ? grab_key_variants(display, kc_print, 0, root)
+                         : 0;
 
-    /* Grab errors are delivered asynchronously by Xlib. Drain them before
-       deciding that the daemon owns its hotkeys. */
-    XSync(display, False);
-    if (s_xerror != 0 || !grabbed) {
+    if (grab_alt_p == 0 && grab_shift_alt_p == 0) {
         fprintf(stderr,
-                "gnuchanscreenshot: could not grab the hotkeys; another "
-                "program may hold them (X error %d)\n", s_xerror);
+                "gnuchanscreenshot: could not grab Alt+P or Shift+Alt+P; "
+                "another program may hold both shortcuts\n");
         XCloseDisplay(display);
         return 1;
+    }
+    if (grab_alt_p == 0 || grab_shift_alt_p == 0) {
+        fprintf(stderr,
+                "gnuchanscreenshot: one screenshot shortcut could not be "
+                "grabbed; X error %d\n", s_grab_error);
+    }
+    if (config.settings_window && grab_print == 0) {
+        fprintf(stderr,
+                "gnuchanscreenshot: Print could not be grabbed; another "
+                "program may own that key (X error %d)\n", s_grab_error);
     }
 
     /* Signals let the session end the daemon cleanly. */
@@ -1355,9 +1389,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    XUngrabKey(display, kc_p, Mod1Mask, root);
-    XUngrabKey(display, kc_p, Mod1Mask | ShiftMask, root);
-    XUngrabKey(display, kc_print, 0, root);
+    for (unsigned int variant = 0; variant < 8; variant++) {
+        XUngrabKey(display, kc_p,
+                   hotkey_modifier_mask(Mod1Mask, variant), root);
+        XUngrabKey(display, kc_p,
+                   hotkey_modifier_mask(Mod1Mask | ShiftMask, variant), root);
+        if (config.settings_window) {
+            XUngrabKey(display, kc_print,
+                       hotkey_modifier_mask(0, variant), root);
+        }
+    }
     XCloseDisplay(display);
     return 0;
 }
