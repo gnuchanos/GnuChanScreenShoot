@@ -5,6 +5,15 @@
 #include <assert.h>
 
 int main(void) {
+    assert(screenshot_hotkey_action(42, Mod1Mask, 42, 1) ==
+           SS_HOTKEY_CAPTURE_FOCUSED);
+    assert(screenshot_hotkey_action(42, Mod1Mask, 42, 0) ==
+           SS_HOTKEY_CAPTURE_SCREEN);
+    assert(screenshot_hotkey_action(42, Mod1Mask | ShiftMask, 42, 1) ==
+           SS_HOTKEY_CAPTURE_REGION);
+    assert(screenshot_hotkey_action(42, ShiftMask, 42, 1) == SS_SELECT_NONE);
+    assert(screenshot_hotkey_action(43, Mod1Mask, 42, 1) == SS_SELECT_NONE);
+
     assert(hotkey_modifier_mask(Mod1Mask, 0) == Mod1Mask);
     assert(hotkey_modifier_mask(Mod1Mask, 1) == (Mod1Mask | LockMask));
     assert(hotkey_modifier_mask(Mod1Mask | ShiftMask, 2) ==
@@ -34,6 +43,11 @@ int main(void) {
     assert(normalize_region(10, 10, 10, 20, 800, 600,
                             &x, &y, &width, &height) == -1);
     assert(normalize_region(10, 10, 801, 20, 800, 600,
+                            &x, &y, &width, &height) == -1);
+    assert(normalize_region(0, 0, 800, 600, 800, 600,
+                            &x, &y, &width, &height) == 0);
+    assert(x == 0 && y == 0 && width == 800 && height == 600);
+    assert(normalize_region(-1, 10, 20, 30, 800, 600,
                             &x, &y, &width, &height) == -1);
 
     char first_path[SS_TEXT_LENGTH];

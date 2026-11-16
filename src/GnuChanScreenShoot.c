@@ -8,7 +8,7 @@
  *
  * Two hotkeys, one job:
  *
- *   Alt+P        choose a window with the pointer, then save and copy it.
+ *   Alt+P        capture the focused window or full screen, as configured.
  *   Shift+Alt+P  drag a screen region, then save and copy it.
  *   Print/SysRq  open an X11 window with the detailed settings: where
  *                screenshots go, which format, JPEG quality, and the default
@@ -23,6 +23,7 @@
  * nothing is ever overwritten.
  */
 #include <signal.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,7 @@
 #include <errno.h>
 #include <setjmp.h>
 #include <stdint.h>
+#include <poll.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
@@ -52,6 +54,17 @@
 
 /* How long the settings window waits before closing itself when idle. */
 #define SS_SETTINGS_IDLE_MS 30000
+#define SS_SETTINGS_WIDTH 620
+#define SS_SETTINGS_HEIGHT 510
+#define SS_SETTINGS_ROW_Y 94
+#define SS_SETTINGS_ROW_STEP 56
+#define SS_SETTINGS_BUTTON_Y 416
+#define SS_SELECT_NONE 0
+#define SS_SELECT_WINDOW 1
+#define SS_SELECT_REGION 2
+#define SS_HOTKEY_CAPTURE_FOCUSED 1
+#define SS_HOTKEY_CAPTURE_SCREEN 2
+#define SS_HOTKEY_CAPTURE_REGION 3
 
 static volatile sig_atomic_t s_should_stop = 0;
 
@@ -60,8 +73,61 @@ static void handle_signal(int signum) {
     s_should_stop = 1;
 }
 
+static int next_x_event(Display *display, XEvent *event) {
+    while (!s_should_stop) {
+        if (XPending(display) > 0) {
+            XNextEvent(display, event);
+            return 1;
+        }
+        struct pollfd connection = {
+            .fd = ConnectionNumber(display),
+            .events = POLLIN,
+        };
+        int ready = poll(&connection, 1, 8);
+        if (ready < 0 && errno != EINTR) {
+            fprintf(stderr, "gnuchanscreenshot: waiting for X11 events failed: %s\n",
+                    strerror(errno));
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static void coalesce_region_motion_events(Display *display, XEvent *event) {
+    while (event->type == MotionNotify &&
+           XEventsQueued(display, QueuedAlready) > 0) {
+        XEvent queued;
+        XPeekEvent(display, &queued);
+        if (queued.type != MotionNotify) {
+            break;
+        }
+        XNextEvent(display, event);
+    }
+}
+
 static int s_xerror = 0;
 static int s_grab_error = 0;
+
+typedef struct SsSelectorPalette {
+    unsigned long background;
+    unsigned long accent;
+    unsigned long text;
+} SsSelectorPalette;
+
+static SsSelectorPalette selector_palette(Display *display, int screen);
+
+static int screenshot_hotkey_action(KeyCode keycode, unsigned int state,
+                                    KeyCode capture_keycode,
+                                    int capture_focused) {
+    if (keycode != capture_keycode || !(state & Mod1Mask)) {
+        return SS_SELECT_NONE;
+    }
+    if (state & ShiftMask) {
+        return SS_HOTKEY_CAPTURE_REGION;
+    }
+    return capture_focused ? SS_HOTKEY_CAPTURE_FOCUSED
+                           : SS_HOTKEY_CAPTURE_SCREEN;
+}
 
 static int error_handler(Display *dpy, XErrorEvent *ev) {
     (void)dpy;
@@ -583,6 +649,49 @@ static int take_region_screenshot(Display *display, const SsConfig *config,
     return save_screenshot(config, image);
 }
 
+static void show_capture_feedback(Display *display, int screen,
+                                  const char *message, int success) {
+    int width = 460;
+    int height = 48;
+    Window root = RootWindow(display, screen);
+    SsSelectorPalette palette = selector_palette(display, screen);
+    XSetWindowAttributes attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.override_redirect = True;
+    attributes.background_pixel = palette.background;
+    attributes.border_pixel = palette.accent;
+    Window toast = XCreateWindow(
+        display, root, (DisplayWidth(display, screen) - width) / 2, 24,
+        (unsigned int)width, (unsigned int)height, 2, CopyFromParent,
+        InputOutput, CopyFromParent,
+        CWOverrideRedirect | CWBackPixel | CWBorderPixel,
+        &attributes);
+    if (toast == None) return;
+    GC gc = XCreateGC(display, toast, 0, NULL);
+    XFontStruct *font = XLoadQueryFont(display, "fixed");
+    if (gc) {
+        XColor color, exact;
+        unsigned long text_color = palette.text;
+        const char *color_name = success ? "#5bd27a" : "#ff6678";
+        if (XAllocNamedColor(display, DefaultColormap(display, screen),
+                             color_name, &color, &exact)) {
+            text_color = color.pixel;
+        }
+        XSetForeground(display, gc, text_color);
+        if (font) XSetFont(display, gc, font->fid);
+        XMapRaised(display, toast);
+        XDrawString(display, toast, gc, 16, 29, message, (int)strlen(message));
+        XFlush(display);
+    }
+    struct timespec delay = {1, 200000000L};
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+    if (font) XFreeFont(display, font);
+    if (gc) XFreeGC(display, gc);
+    XDestroyWindow(display, toast);
+    XFlush(display);
+}
+
 static int normalize_region(int start_x, int start_y, int end_x, int end_y,
                             int screen_width, int screen_height,
                             int *x, int *y, unsigned int *width,
@@ -637,14 +746,6 @@ static void region_overlay_update(Display *display, Window overlay,
     XClearWindow(display, overlay);
 }
 
-static Window selection_key_window(Display *display, Window root) {
-    XSetWindowAttributes attributes;
-    memset(&attributes, 0, sizeof(attributes));
-    attributes.event_mask = KeyPressMask;
-    return XCreateWindow(display, root, 0, 0, 1, 1, 0, 0, InputOnly,
-                         CopyFromParent, CWEventMask, &attributes);
-}
-
 /* --- settings window ------------------------------------------------------ */
 
 /* The whole settings window: one display, one window, a few labels and
@@ -663,20 +764,101 @@ typedef struct SsSettingsUi {
     char save_dir_text[SS_TEXT_LENGTH];
     int format_png;    /* 1 when PNG, 0 when JPEG */
     int quality;       /* 1..100 */
+    int pending_selection;
     int capture_focused;
     int settings_window;
     int capture_mode;
     int focused_field;
     Window initial_target;
     Window chosen_target;
+    int has_region;
+    int region_x;
+    int region_y;
+    unsigned int region_width;
+    unsigned int region_height;
     char status[128];
 } SsSettingsUi;
+
+static int read_window_theme_color(const char *key, char out[8]) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    char path[PATH_MAX];
+    if (xdg && xdg[0]) {
+        snprintf(path, sizeof(path), "%s/GnuChanWM/GnuChanWM.conf", xdg);
+    } else if (home && home[0]) {
+        snprintf(path, sizeof(path), "%s/.config/GnuChanWM/GnuChanWM.conf", home);
+    } else {
+        return 0;
+    }
+    FILE *file = fopen(path, "r");
+    if (!file) return 0;
+    int found = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), file)) {
+        char *content = line;
+        while (isspace((unsigned char)*content)) content++;
+        if (*content == '#' || !strstr(content, key)) continue;
+        char *hex = strchr(content, '#');
+        if (!hex || strlen(hex) < 7) continue;
+        int valid = 1;
+        for (int i = 1; i <= 6; i++) {
+            if (!isxdigit((unsigned char)hex[i])) valid = 0;
+        }
+        if (!valid) continue;
+        memcpy(out, hex, 7);
+        out[7] = '\0';
+        found = 1;
+        break;
+    }
+    fclose(file);
+    return found;
+}
+
+static SsSelectorPalette selector_palette(Display *display, int screen) {
+    char background[8] = "#1a0b2e";
+    char accent[8] = "#c77dff";
+    char text[8] = "#e0c3fc";
+    read_window_theme_color("BackgroundColor", background);
+    read_window_theme_color("set_active_window_border_color", accent);
+    read_window_theme_color("ForegroundColor", text);
+    Colormap colormap = DefaultColormap(display, screen);
+    XColor value, exact;
+    SsSelectorPalette palette = {
+        BlackPixel(display, screen),
+        WhitePixel(display, screen),
+        WhitePixel(display, screen),
+    };
+    if (XAllocNamedColor(display, colormap, background, &value, &exact)) {
+        palette.background = value.pixel;
+    }
+    if (XAllocNamedColor(display, colormap, accent, &value, &exact)) {
+        palette.accent = value.pixel;
+    }
+    if (XAllocNamedColor(display, colormap, text, &value, &exact)) {
+        palette.text = value.pixel;
+    }
+    return palette;
+}
 
 static void ss_settings_draw_text(SsSettingsUi *ui, int x, int y,
                                   const char *text, unsigned long pixel) {
     XSetForeground(ui->display, ui->gc, pixel);
     XDrawString(ui->display, ui->window, ui->gc, x, y, text,
                 (int)strlen(text));
+}
+
+static void ss_settings_draw_button(SsSettingsUi *ui, int x, int width,
+                                    const char *label) {
+    XSetForeground(ui->display, ui->gc, 0x65428a);
+    XFillRectangle(ui->display, ui->window, ui->gc, x,
+                   SS_SETTINGS_BUTTON_Y, (unsigned int)width, 44);
+    XSetForeground(ui->display, ui->gc, 0x9871b5);
+    XDrawRectangle(ui->display, ui->window, ui->gc, x,
+                   SS_SETTINGS_BUTTON_Y, (unsigned int)(width - 1), 43);
+    XSetForeground(ui->display, ui->gc, 0xf5eaff);
+    int text_x = x + (width - (int)strlen(label) * 6) / 2;
+    XDrawString(ui->display, ui->window, ui->gc, text_x,
+                SS_SETTINGS_BUTTON_Y + 27, label, (int)strlen(label));
 }
 
 static void ss_settings_redraw(SsSettingsUi *ui) {
@@ -689,7 +871,7 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
                             : "GnuChanScreenShoot settings";
     XDrawString(ui->display, ui->window, ui->gc, 20, 34, title,
                 (int)strlen(title));
-    int yy = 78;
+    int yy = SS_SETTINGS_ROW_Y;
     char line[SS_TEXT_LENGTH];
     const char *labels[] = {
         "Save directory",
@@ -702,39 +884,36 @@ static void ss_settings_redraw(SsSettingsUi *ui) {
         ui->save_dir_text,
         ui->format_png ? "PNG" : "JPEG",
         NULL,
-        ui->chosen_target != None ? "Chosen window" :
-            (ui->capture_focused ? "Focused window" : "Whole screen"),
+        ui->has_region ? "Chosen region" :
+            (ui->chosen_target != None ? "Chosen window" :
+                (ui->capture_focused ? "Focused window" : "Whole screen")),
         ui->settings_window ? "Enabled" : "Disabled",
     };
     for (int i = 0; i < 5; i++) {
-        int y = yy + i * 48;
+        int y = yy + i * SS_SETTINGS_ROW_STEP;
         XSetForeground(ui->display, ui->gc,
                        i == ui->focused_field ? 0x392150 : 0x2b1740);
-        XFillRectangle(ui->display, ui->window, ui->gc, 16, y - 22, 468, 38);
+        XFillRectangle(ui->display, ui->window, ui->gc, 20, y - 22, 580, 44);
         XSetForeground(ui->display, ui->gc, 0x65428a);
-        XDrawRectangle(ui->display, ui->window, ui->gc, 16, y - 22, 467, 37);
-        ss_settings_draw_text(ui, 26, y, labels[i], 0xf5eaff);
+        XDrawRectangle(ui->display, ui->window, ui->gc, 20, y - 22, 579, 43);
+        ss_settings_draw_text(ui, 34, y, labels[i], 0xf5eaff);
         if (i == 2) {
             snprintf(line, sizeof(line), "%d", ui->quality);
-            ss_settings_draw_text(ui, 350, y, line, 0xd8c8ed);
+            ss_settings_draw_text(ui, 360, y, line, 0xd8c8ed);
         } else {
-            ss_settings_draw_text(ui, 280, y, values[i], 0xd8c8ed);
+            ss_settings_draw_text(ui, 340, y, values[i], 0xd8c8ed);
         }
     }
 
-    XSetForeground(ui->display, ui->gc, 0x65428a);
-    XFillRectangle(ui->display, ui->window, ui->gc, 16, 330, 112, 38);
-    XFillRectangle(ui->display, ui->window, ui->gc, 140, 330, 112, 38);
-    XFillRectangle(ui->display, ui->window, ui->gc, 280, 330, 100, 38);
-    XFillRectangle(ui->display, ui->window, ui->gc, 390, 330, 94, 38);
-    XSetForeground(ui->display, ui->gc, 0xf5eaff);
-    XDrawString(ui->display, ui->window, ui->gc, 26, 354, "Choose window", 13);
-    XDrawString(ui->display, ui->window, ui->gc, 169, 354, "Capture", 7);
-    XDrawString(ui->display, ui->window, ui->gc, 307, 354, "Cancel", 6);
-    XDrawString(ui->display, ui->window, ui->gc, 416, 354, "Save", 4);
+    ss_settings_draw_button(ui, 24, 130, "Choose window");
+    ss_settings_draw_button(ui, 164, 124, "Choose area");
+    ss_settings_draw_button(ui, 300, 98, "Capture");
+    ss_settings_draw_button(ui, 410, 88, "Cancel");
+    ss_settings_draw_button(ui, 510, 86, "Save");
     if (ui->status[0]) {
-        ss_settings_draw_text(ui, 20, 397, ui->status,
-                              ui->chosen_target != None ? 0x8fe6a2 : 0xff6b8a);
+        ss_settings_draw_text(ui, 24, 484, ui->status,
+                              (ui->chosen_target != None || ui->has_region)
+                                  ? 0x8fe6a2 : 0xff6b8a);
     }
 }
 
@@ -809,30 +988,69 @@ static int ss_settings_save(SsSettingsUi *ui) {
 static Window select_window(Display *display, Window root, Window settings) {
     Window settings_root = root_child(display, settings);
     Cursor cursor = XCreateFontCursor(display, XC_crosshair);
-    Window key_window = selection_key_window(display, root);
-    if (key_window != None) {
-        XMapWindow(display, key_window);
+    int screen = DefaultScreen(display);
+    SsSelectorPalette palette = selector_palette(display, screen);
+    int prompt_width = 320;
+    XSetWindowAttributes prompt_attributes;
+    memset(&prompt_attributes, 0, sizeof(prompt_attributes));
+    prompt_attributes.override_redirect = True;
+    prompt_attributes.background_pixel = palette.background;
+    prompt_attributes.border_pixel = palette.accent;
+    Window prompt = XCreateWindow(
+        display, root, (DisplayWidth(display, screen) - prompt_width) / 2, 16,
+        (unsigned int)prompt_width, 36, 2, CopyFromParent, InputOutput,
+        CopyFromParent, CWOverrideRedirect | CWBackPixel | CWBorderPixel,
+        &prompt_attributes);
+    if (prompt != None) {
+        XSelectInput(display, prompt, ExposureMask);
     }
-    if (cursor == None || key_window == None ||
-        XGrabPointer(display, root, False, ButtonPressMask,
-                     GrabModeAsync, GrabModeAsync, None, cursor,
-                     CurrentTime) != GrabSuccess ||
-        XGrabKeyboard(display, key_window, False, GrabModeAsync,
-                      GrabModeAsync, CurrentTime) != GrabSuccess) {
+    if (cursor == None || prompt == None) {
         XUngrabPointer(display, CurrentTime);
         XUngrabKeyboard(display, CurrentTime);
-        if (key_window != None) XDestroyWindow(display, key_window);
+        if (prompt != None) XDestroyWindow(display, prompt);
         if (cursor != None) XFreeCursor(display, cursor);
         fprintf(stderr,
-                "gnuchanscreenshot: could not start window selection\n");
+                "gnuchanscreenshot: could not create the window selector\n");
         return None;
     }
+    int pointer_grab = XGrabPointer(display, root, False, ButtonPressMask,
+                                    GrabModeAsync, GrabModeAsync, None, cursor,
+                                    CurrentTime);
+    int keyboard_grab = pointer_grab == GrabSuccess
+                            ? XGrabKeyboard(display, root, False,
+                                            GrabModeAsync, GrabModeAsync,
+                                            CurrentTime)
+                            : GrabNotViewable;
+    if (pointer_grab != GrabSuccess || keyboard_grab != GrabSuccess) {
+        XUngrabPointer(display, CurrentTime);
+        XUngrabKeyboard(display, CurrentTime);
+        if (prompt != None) XDestroyWindow(display, prompt);
+        if (cursor != None) XFreeCursor(display, cursor);
+        fprintf(stderr,
+                "gnuchanscreenshot: could not grab window selector input "
+                "(pointer=%d, keyboard=%d)\n",
+                pointer_grab, keyboard_grab);
+        return None;
+    }
+    XMapRaised(display, prompt);
     XFlush(display);
     Window target = None;
     int done = 0;
     while (!done && !s_should_stop) {
         XEvent event;
-        XNextEvent(display, &event);
+        if (!next_x_event(display, &event)) {
+            break;
+        }
+        if (event.type == Expose && event.xexpose.window == prompt) {
+            GC gc = XCreateGC(display, prompt, 0, NULL);
+            if (gc) {
+                XSetForeground(display, gc, palette.text);
+                XDrawString(display, prompt, gc, 14, 23,
+                            "Click a window to capture - Esc cancels", 39);
+                XFreeGC(display, gc);
+            }
+            continue;
+        }
         if (event.type == KeyPress &&
             XLookupKeysym(&event.xkey, 0) == XK_Escape) {
             done = 1;
@@ -854,6 +1072,10 @@ static Window select_window(Display *display, Window root, Window settings) {
             child != None) {
             target = root_child(display, child);
         }
+        if (target == prompt) {
+            target = None;
+            continue;
+        }
         if (target == settings_root || target == root) {
             target = None;
         }
@@ -861,7 +1083,7 @@ static Window select_window(Display *display, Window root, Window settings) {
     }
     XUngrabPointer(display, CurrentTime);
     XUngrabKeyboard(display, CurrentTime);
-    XDestroyWindow(display, key_window);
+    XDestroyWindow(display, prompt);
     XFreeCursor(display, cursor);
     XFlush(display);
     return target;
@@ -883,33 +1105,27 @@ static int select_region(Display *display, Window root, int screen,
     XSetWindowAttributes attributes;
     memset(&attributes, 0, sizeof(attributes));
     attributes.override_redirect = True;
-    attributes.background_pixel = WhitePixel(display, screen);
+    SsSelectorPalette palette = selector_palette(display, screen);
+    attributes.background_pixel = palette.accent;
     Window overlay = XCreateWindow(
         display, root, 0, 0, (unsigned int)screen_width,
         (unsigned int)screen_height, 0, CopyFromParent, InputOutput,
         CopyFromParent, CWOverrideRedirect | CWBackPixel, &attributes);
     Cursor cursor = XCreateFontCursor(display, XC_crosshair);
-    Window key_window = selection_key_window(display, root);
-    if (overlay == None || cursor == None || key_window == None) {
+    if (overlay == None || cursor == None) {
         if (overlay != None) XDestroyWindow(display, overlay);
-        if (key_window != None) XDestroyWindow(display, key_window);
         if (cursor != None) XFreeCursor(display, cursor);
         fprintf(stderr,
                 "gnuchanscreenshot: could not create the region selector\n");
         return -1;
     }
 
-    XColor color, exact;
-    if (XAllocNamedColor(display, DefaultColormap(display, screen),
-                         "#ff4fd8", &color, &exact)) {
-        XSetWindowBackground(display, overlay, color.pixel);
-    }
+    XSetWindowBackground(display, overlay, palette.accent);
     int initial_x = screen_width / 2;
     int initial_y = screen_height / 2;
     region_overlay_update(display, overlay, screen_width, screen_height,
                           initial_x, initial_y, 0, 0, 0);
     XMapRaised(display, overlay);
-    XMapWindow(display, key_window);
     XFlush(display);
 
     int pointer_grab = XGrabPointer(
@@ -917,7 +1133,7 @@ static int select_region(Display *display, Window root, int screen,
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
         GrabModeAsync, GrabModeAsync, None, cursor, CurrentTime);
     int keyboard_grab = pointer_grab == GrabSuccess
-                            ? XGrabKeyboard(display, key_window, False,
+                            ? XGrabKeyboard(display, root, False,
                                             GrabModeAsync, GrabModeAsync,
                                             CurrentTime)
                             : GrabNotViewable;
@@ -925,20 +1141,27 @@ static int select_region(Display *display, Window root, int screen,
         XUngrabPointer(display, CurrentTime);
         XUngrabKeyboard(display, CurrentTime);
         XDestroyWindow(display, overlay);
-        XDestroyWindow(display, key_window);
         XFreeCursor(display, cursor);
         XFlush(display);
         fprintf(stderr,
-                "gnuchanscreenshot: could not start region selection\n");
+            "gnuchanscreenshot: could not grab region selector input "
+            "(pointer=%d, keyboard=%d)\n",
+            pointer_grab, keyboard_grab);
         return -1;
     }
 
     int start_x = 0, start_y = 0, end_x = 0, end_y = 0;
+    int anchor_set = 0;
     int dragging = 0;
     int selected = 0;
     while (!s_should_stop) {
         XEvent event;
-        XNextEvent(display, &event);
+        if (!next_x_event(display, &event)) {
+            break;
+        }
+        if (event.type == MotionNotify) {
+            coalesce_region_motion_events(display, &event);
+        }
         if (event.type == KeyPress &&
             XLookupKeysym(&event.xkey, 0) == XK_Escape) {
             break;
@@ -947,8 +1170,11 @@ static int select_region(Display *display, Window root, int screen,
             if (event.xbutton.button != Button1) {
                 break;
             }
-            start_x = event.xbutton.x_root;
-            start_y = event.xbutton.y_root;
+            if (!anchor_set) {
+                start_x = event.xbutton.x_root;
+                start_y = event.xbutton.y_root;
+                anchor_set = 1;
+            }
             end_x = start_x;
             end_y = start_y;
             dragging = 1;
@@ -961,7 +1187,10 @@ static int select_region(Display *display, Window root, int screen,
             selected = normalize_region(start_x, start_y, end_x, end_y,
                                         screen_width, screen_height,
                                         x, y, width, height) == 0;
-            break;
+            if (selected) {
+                break;
+            }
+            dragging = 0;
         } else {
             continue;
         }
@@ -973,10 +1202,54 @@ static int select_region(Display *display, Window root, int screen,
     XUngrabPointer(display, CurrentTime);
     XUngrabKeyboard(display, CurrentTime);
     XDestroyWindow(display, overlay);
-    XDestroyWindow(display, key_window);
     XFreeCursor(display, cursor);
     XFlush(display);
     return selected ? 1 : 0;
+}
+
+static void ss_settings_choose_window(SsSettingsUi *ui) {
+    Window root = RootWindow(ui->display, ui->screen);
+    XUnmapWindow(ui->display, ui->window);
+    XSync(ui->display, False);
+    Window selected = select_window(ui->display, root, ui->window);
+    XMapRaised(ui->display, ui->window);
+    XSync(ui->display, False);
+    if (selected != None) {
+        ui->chosen_target = selected;
+        ui->has_region = 0;
+        snprintf(ui->status, sizeof(ui->status),
+                 "Window chosen; size is read at capture time");
+    } else {
+        snprintf(ui->status, sizeof(ui->status), "Could not choose a window");
+    }
+    ss_settings_redraw(ui);
+}
+
+static void ss_settings_choose_region(SsSettingsUi *ui) {
+    Window root = RootWindow(ui->display, ui->screen);
+    int x = 0, y = 0;
+    unsigned int width = 0, height = 0;
+    XUnmapWindow(ui->display, ui->window);
+    XSync(ui->display, False);
+    int selected = select_region(ui->display, root, ui->screen, &x, &y,
+                                 &width, &height);
+    XMapRaised(ui->display, ui->window);
+    XSync(ui->display, False);
+    if (selected > 0) {
+        ui->region_x = x;
+        ui->region_y = y;
+        ui->region_width = width;
+        ui->region_height = height;
+        ui->has_region = 1;
+        ui->chosen_target = None;
+        snprintf(ui->status, sizeof(ui->status), "Region selected: %ux%u",
+                 width, height);
+    } else {
+        snprintf(ui->status, sizeof(ui->status),
+                 selected == 0 ? "Region selection cancelled"
+                               : "Could not select a region");
+    }
+    ss_settings_redraw(ui);
 }
 
 /* Open the settings window, run until the user closes it or the idle timer
@@ -984,8 +1257,8 @@ static int select_region(Display *display, Window root, int screen,
 static int run_settings_window(Display *display, int screen,
                                const SsConfig *config, int capture_mode,
                                Window initial_target) {
-    int width = 500;
-    int height = 420;
+    int width = SS_SETTINGS_WIDTH;
+    int height = SS_SETTINGS_HEIGHT;
     Window root = RootWindow(display, screen);
     int x = (DisplayWidth(display, screen) - width) / 2;
     int y = (DisplayHeight(display, screen) - height) / 2;
@@ -1028,6 +1301,7 @@ static int run_settings_window(Display *display, int screen,
     ui.gc = XCreateGC(display, ui.window, 0, NULL);
     XSelectInput(display, ui.window,
                  ExposureMask | KeyPressMask | ButtonPressMask |
+                 ButtonReleaseMask |
                  StructureNotifyMask);
     XMapWindow(display, ui.window);
     XStoreName(display, ui.window, capture_mode
@@ -1101,22 +1375,26 @@ static int run_settings_window(Display *display, int screen,
             }
             case ButtonPress: {
                 int y = event.xbutton.y;
-                if (y >= 330 && event.xbutton.x < 128) {
+                int button_x = event.xbutton.x;
+                if (y >= SS_SETTINGS_BUTTON_Y &&
+                    y < SS_SETTINGS_BUTTON_Y + 44 &&
+                    button_x >= 24 && button_x < 154) {
                     snprintf(ui.status, sizeof(ui.status),
                              "Click a window to choose it");
                     ss_settings_redraw(&ui);
                     XFlush(display);
-                    Window selected = select_window(display, root, ui.window);
-                    if (selected != None) {
-                        ui.chosen_target = selected;
-                        snprintf(ui.status, sizeof(ui.status),
-                                 "Window chosen; size is read at capture time");
-                    } else {
-                        snprintf(ui.status, sizeof(ui.status),
-                                 "Could not choose a window");
-                    }
-                } else if (y >= 330 && event.xbutton.x < 260 &&
-                           event.xbutton.x >= 140) {
+                    ui.pending_selection = SS_SELECT_WINDOW;
+                } else if (y >= SS_SETTINGS_BUTTON_Y &&
+                           y < SS_SETTINGS_BUTTON_Y + 44 &&
+                           button_x >= 164 && button_x < 288) {
+                    snprintf(ui.status, sizeof(ui.status),
+                             "Drag to select a screen region; Escape cancels");
+                    ss_settings_redraw(&ui);
+                    XFlush(display);
+                    ui.pending_selection = SS_SELECT_REGION;
+                } else if (y >= SS_SETTINGS_BUTTON_Y &&
+                           y < SS_SETTINGS_BUTTON_Y + 44 &&
+                           button_x >= 300 && button_x < 398) {
                     SsConfig capture = *config;
                     snprintf(capture.save_dir, sizeof(capture.save_dir), "%s",
                              ui.save_dir_text);
@@ -1134,41 +1412,73 @@ static int run_settings_window(Display *display, int screen,
                     if (require_clipboard_helper() != 0) {
                         snprintf(ui.status, sizeof(ui.status),
                                  "Install xclip for clipboard capture");
-                    } else if (take_screenshot(display, &capture, target) == 0) {
-                        ui.done = 1;
                     } else {
-                        snprintf(ui.status, sizeof(ui.status),
-                                 "Capture failed; see error output");
+                        XUnmapWindow(display, ui.window);
+                        XSync(display, False);
+                        /* Give the compositor time to remove the window before
+                           reading the screen, so the capture UI is not included. */
+                        {
+                            struct timespec settle = {0, 150000000L};
+                            nanosleep(&settle, NULL);
+                        }
+                        int result = ui.has_region
+                            ? take_region_screenshot(display, &capture,
+                                  ui.region_x, ui.region_y,
+                                  ui.region_width, ui.region_height)
+                            : take_screenshot(display, &capture, target);
+                        if (result == 0) {
+                            ui.done = 1;
+                        } else {
+                            XMapRaised(display, ui.window);
+                            XSync(display, False);
+                            snprintf(ui.status, sizeof(ui.status),
+                                     "Capture failed; see error output");
+                        }
                     }
-                } else if (y >= 330 && event.xbutton.x >= 390) {
+                } else if (y >= SS_SETTINGS_BUTTON_Y &&
+                           y < SS_SETTINGS_BUTTON_Y + 44 &&
+                           button_x >= 510 && button_x < 596) {
                     if (ss_settings_save(&ui) == 0) {
                         ui.done = 1;
                     }
-                } else if (y >= 330 && event.xbutton.x >= 280) {
+                } else if (y >= SS_SETTINGS_BUTTON_Y &&
+                           y < SS_SETTINGS_BUTTON_Y + 44 &&
+                           button_x >= 410 && button_x < 498) {
                     ui.done = 1;
-                } else if (y >= 56 && y < 104) {
-                    ui.focused_field = 0;
-                } else if (y < 152 && y >= 104) {
-                    ui.focused_field = 1;
-                    ui.format_png = !ui.format_png;
-                } else if (y < 200 && y >= 152) {
-                    ui.focused_field = 2;
-                    if (event.xbutton.x < 250 && ui.quality > 1) {
-                        ui.quality--;
-                    } else if (ui.quality < 100) {
-                        ui.quality++;
+                } else if (y >= SS_SETTINGS_ROW_Y - 22) {
+                    int row_offset = y - (SS_SETTINGS_ROW_Y - 22);
+                    int row = row_offset / SS_SETTINGS_ROW_STEP;
+                    if (row < 5 && row_offset % SS_SETTINGS_ROW_STEP < 44) {
+                        ui.focused_field = row;
+                        if (row == 1) {
+                            ui.format_png = !ui.format_png;
+                        } else if (row == 2) {
+                            if (button_x < 300 && ui.quality > 1) {
+                                ui.quality--;
+                            } else if (ui.quality < 100) {
+                                ui.quality++;
+                            }
+                        } else if (row == 3) {
+                            ui.capture_focused = !ui.capture_focused;
+                            ui.chosen_target = None;
+                            ui.has_region = 0;
+                        } else if (row == 4) {
+                            ui.settings_window = !ui.settings_window;
+                        }
                     }
-                } else if (y < 248 && y >= 200) {
-                    ui.focused_field = 3;
-                    ui.capture_focused = !ui.capture_focused;
-                    ui.chosen_target = None;
-                } else if (y < 296 && y >= 248) {
-                    ui.focused_field = 4;
-                    ui.settings_window = !ui.settings_window;
                 }
                 ss_settings_redraw(&ui);
                 break;
             }
+            case ButtonRelease:
+                if (ui.pending_selection == SS_SELECT_WINDOW) {
+                    ui.pending_selection = SS_SELECT_NONE;
+                    ss_settings_choose_window(&ui);
+                } else if (ui.pending_selection == SS_SELECT_REGION) {
+                    ui.pending_selection = SS_SELECT_NONE;
+                    ss_settings_choose_region(&ui);
+                }
+                break;
             default:
                 break;
             }
@@ -1206,7 +1516,8 @@ int main(int argc, char **argv) {
                    "[--capture] "
                    "[--version]\n"
                    "\n"
-                   "Alt+P selects a window; Shift+Alt+P selects a region.\n"
+                   "Alt+P captures the configured focused window or full screen.\n"
+                   "Shift+Alt+P selects a screen region.\n"
                    "Print/SysRq opens settings. Use --capture for the\n"
                    "settings capture chooser.\n"
                    "Settings live in\n"
@@ -1332,39 +1643,47 @@ int main(int argc, char **argv) {
 
     while (!s_should_stop) {
         XEvent event;
-        XNextEvent(display, &event);
+        if (!next_x_event(display, &event)) {
+            break;
+        }
 
         if (event.type == KeyPress) {
             KeyCode code = event.xkey.keycode;
             unsigned int state = event.xkey.state;
 
-            int is_alt = (state & Mod1Mask) != 0;
-            if (code == kc_p && is_alt) {
+            int capture_action = screenshot_hotkey_action(
+                code, state, kc_p, config.capture_focused);
+            if (capture_action != SS_SELECT_NONE) {
+                /* XGrabKey activates a temporary keyboard grab for this press. */
+                XUngrabKeyboard(display, CurrentTime);
+                XSync(display, False);
                 if (require_clipboard_helper() == 0) {
-                    if (state & ShiftMask) {
+                    if (capture_action == SS_HOTKEY_CAPTURE_REGION) {
                         int x = 0, y = 0;
                         unsigned int width = 0, height = 0;
                         int selected = select_region(display, root, screen,
                                                      &x, &y, &width, &height);
                         if (selected > 0) {
-                            (void)take_region_screenshot(
+                            int result = take_region_screenshot(
                                 display, &config, x, y, width, height);
+                            show_capture_feedback(display, screen,
+                                result == 0 ? "Screenshot saved and copied to clipboard"
+                                            : "Screenshot failed; check terminal output",
+                                result == 0);
                         } else if (selected == 0) {
                             fprintf(stderr,
                                     "gnuchanscreenshot: region selection "
                                     "cancelled; no screenshot was taken\n");
                         }
                     } else {
-                        Window selected = select_window(display, root, None);
-                        if (selected != None) {
-                            SsConfig capture = config;
-                            capture.capture_focused = 1;
-                            (void)take_screenshot(display, &capture, selected);
-                        } else {
-                            fprintf(stderr,
-                                    "gnuchanscreenshot: window selection "
-                                    "cancelled; no screenshot was taken\n");
-                        }
+                        SsConfig capture = config;
+                        capture.capture_focused =
+                            capture_action == SS_HOTKEY_CAPTURE_FOCUSED;
+                        int result = take_screenshot(display, &capture, None);
+                        show_capture_feedback(display, screen,
+                            result == 0 ? "Screenshot saved and copied to clipboard"
+                                        : "Screenshot failed; check terminal output",
+                            result == 0);
                     }
                 }
                 SsConfig fresh;
@@ -1375,6 +1694,8 @@ int main(int argc, char **argv) {
             }
             if (code == kc_print && config.settings_window) {
                 /* Ignore Alt modifier for Print — it is the plain key. */
+                XUngrabKeyboard(display, CurrentTime);
+                XSync(display, False);
                 Window initial_target = current_focus(display);
                 run_settings_window(display, screen, &config, 0,
                                     initial_target);

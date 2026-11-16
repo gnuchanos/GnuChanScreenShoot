@@ -25,7 +25,7 @@
    this directory unless the settings window changes it. */
 #define SS_SAVE_DIR_DEFAULT "~/Pictures"
 
-/* The default shortcuts: Alt+P selects a window, Shift+Alt+P selects a region,
+/* The default shortcuts: Alt+P selects a region, Shift+Alt+P selects a window,
    and Print/SysRq opens settings. */
 #define SS_HOTKEY_CAPTURE "Alt+P"
 #define SS_HOTKEY_SETTINGS "Print"
@@ -75,7 +75,7 @@ typedef struct SsConfig {
     /* JPEG quality, 1..100. Ignored for PNG. */
     int quality;
 
-    /* Whether non-interactive captures target the focused window or screen. */
+    /* Whether Alt+P captures the focused window or whole screen. */
     int capture_focused;
 
     /* Whether the settings window opens on Print/SysRq. */

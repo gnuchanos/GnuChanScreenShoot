@@ -148,8 +148,21 @@ int ss_parse_file(const char *path, struct SsStatement **out,
         *out_count = 0;
         return -1;
     }
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        set_error("could not read settings file");
+        *out = NULL;
+        *out_count = 0;
+        return -1;
+    }
     long sz = ftell(f);
+    if (sz < 0) {
+        fclose(f);
+        set_error("could not read settings file");
+        *out = NULL;
+        *out_count = 0;
+        return -1;
+    }
     rewind(f);
     char *text = malloc((size_t)sz + 1);
     if (!text) {
@@ -184,8 +197,7 @@ int ss_parse_file(const char *path, struct SsStatement **out,
 
         if (!read_name(stmt.target, sizeof(stmt.target))) {
             set_error("expected a name");
-            free(text);
-            return -1;
+            goto fail;
         }
         skip_ws();
 
@@ -202,8 +214,7 @@ int ss_parse_file(const char *path, struct SsStatement **out,
                 value.kind = 2; /* bool */
             } else {
                 set_error("expected a value");
-                free(text);
-                return -1;
+                goto fail;
             }
             stmt.value = value;
         } else if (peek() == '.' || peek() == '(') {
@@ -215,24 +226,21 @@ int ss_parse_file(const char *path, struct SsStatement **out,
                 char method[SS_TEXT_LENGTH];
                 if (!read_name(method, sizeof(method))) {
                     set_error("expected a method name");
-                    free(text);
-                    return -1;
+                    goto fail;
                 }
                 char target[sizeof(stmt.target)];
                 int written = snprintf(target, sizeof(target), "%s.%s",
                                        stmt.target, method);
                 if (written < 0 || (size_t)written >= sizeof(target)) {
                     set_error("setting name is too long");
-                    free(text);
-                    return -1;
+                    goto fail;
                 }
                 memcpy(stmt.target, target, (size_t)written + 1);
             }
             skip_ws();
             if (peek() != '(') {
                 set_error("expected '(' after method name");
-                free(text);
-                return -1;
+                goto fail;
             }
             s_cursor++; /* '(' */
             stmt.kind = SS_STMT_CALL;
@@ -244,21 +252,18 @@ int ss_parse_file(const char *path, struct SsStatement **out,
                 }
                 if (stmt.arg_count >= SS_MAX_ARGS) {
                     set_error("too many arguments");
-                    free(text);
-                    return -1;
+                    goto fail;
                 }
                 SsArgument arg;
                 memset(&arg, 0, sizeof(arg));
                 if (!read_name(arg.name, sizeof(arg.name))) {
                     set_error("expected an argument name");
-                    free(text);
-                    return -1;
+                    goto fail;
                 }
                 skip_ws();
                 if (peek() != '=') {
                     set_error("expected '=' after argument name");
-                    free(text);
-                    return -1;
+                    goto fail;
                 }
                 s_cursor++; /* '=' */
                 SsValue value;
@@ -271,8 +276,7 @@ int ss_parse_file(const char *path, struct SsStatement **out,
                     value.kind = 2;
                 } else {
                     set_error("expected an argument value");
-                    free(text);
-                    return -1;
+                    goto fail;
                 }
                 arg.value = value;
                 stmt.args[stmt.arg_count++] = arg;
@@ -283,20 +287,17 @@ int ss_parse_file(const char *path, struct SsStatement **out,
             }
             if (s_cursor >= s_end || peek() != ')') {
                 set_error("expected ')' to close call");
-                free(text);
-                return -1;
+                goto fail;
             }
             s_cursor++; /* ')' */
         } else {
             set_error("expected '=' or '.' after name");
-            free(text);
-            return -1;
+            goto fail;
         }
 
         if (statement_push(&stmt) != 0) {
             set_error("out of memory");
-            free(text);
-            return -1;
+            goto fail;
         }
         skip_ws();
     }
@@ -305,6 +306,14 @@ int ss_parse_file(const char *path, struct SsStatement **out,
     *out = s_statements;
     *out_count = s_statement_count;
     return 0;
+
+fail:
+    free(text);
+    free(s_statements);
+    s_statements = NULL;
+    s_statement_count = 0;
+    s_statement_capacity = 0;
+    return -1;
 }
 
 void ss_parse_free(struct SsStatement *statements, int count) {

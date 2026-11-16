@@ -43,7 +43,7 @@ DESKTOP_FILE = APPS_DIR / "gnuchanscreenshot.desktop"
 
 # The settings file is installed into the user's config directory only when
 # neither a current .conf nor a legacy .py config already exists.
-CONFIG_SOURCE = ROOT / "GnuChanScreenShoot_config" / "GnuChanScreenShoot.conf"
+CONFIG_SOURCE = ROOT / "config" / "config.conf"
 CONFIG_DIR_NAME = "GnuChanScreenShoot"
 CONFIG_FILE_NAME = "GnuChanScreenShoot.conf"
 
@@ -238,7 +238,7 @@ def desktop_entry() -> str:
     return "\n".join([
         "[Desktop Entry]",
         "Type=Application",
-        "Name=GnuChanScreenShoot",
+        "Name=GnuChan Screenshot",
         "Comment=GnuchanOS screenshot tool",
         f"Exec={BIN_DIR / PROGRAM}",
         f"TryExec={BIN_DIR / PROGRAM}",
